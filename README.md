@@ -1,4 +1,4 @@
-# Multiomics analysis of aggregative multicellularity
+# Multi-omics analysis of aggregative multicellularity
 Source code used to analyse the multi-omics datasets generated during *Dictyostelium discoideum* multicellular development, as well as any figures generated. The code can be found in **Omics_figures_v2.Rmd**, and generated figures and tables in the plots and tables folders, respectively. Input data and annotations are located in data and dictybase_20200923 folders, respectively. A compiled output file of the full analysis with all plots is available in pdf format.
 
 ## Data
