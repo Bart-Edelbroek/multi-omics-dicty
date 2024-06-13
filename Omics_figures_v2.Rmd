@@ -1,0 +1,2185 @@
+---
+title: "Dictyostelium developmental time course"
+author: "Jakub Orzechowski Westholm, Bart Edelbroek"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    code_folding: hide
+    toc: yes
+    toc_float: yes
+    toc_depth: 6
+    collapsed: no
+    number_sections: yes
+  pdf_document:
+    toc: yes
+    toc_depth: '6'	
+always_allow_html: true
+---
+
+# Set up
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, fig.align='center', message = FALSE)
+
+library(dplyr)
+library(knitr)
+library(ComplexHeatmap)
+library(ggplot2)
+library(cowplot)
+library(DESeq2)
+library(biomaRt)
+library(kableExtra)
+library(DT)
+library(tidyverse)
+library(ggfortify)
+library(limma)
+library(RColorBrewer)
+library(circlize)
+library(MOFA2)
+library(topGO)
+library(snowfall)
+library(piano)
+library(patchwork)
+library(eulerr)
+library(scales)
+library(ggrepel)
+library(ggpubr)
+library(lmodel2)
+library(imputeLCMD)
+library(svglite)
+library(multcomp)
+
+set.seed(42)
+
+theme_set(theme_bw())
+theme_update(
+	title = element_text(size = 9), 
+	axis.text = element_text(size = 7),
+	axis.title = element_text(size = 8),
+	legend.text = element_text(size = 7),
+	legend.key.size = unit(3,"mm"), 
+	legend.title = element_text(size = 8), 
+	plot.title = element_text(size = 9)
+)
+
+scale_rows = function(x){
+	m = apply(x, 1, mean, na.rm = T)
+	s = apply(x, 1, sd, na.rm = T)
+	return((x - m) / s)
+}
+
+time_point_means <- function(exp_mat){
+	time_points <- unique(sapply(colnames(exp_mat), function(x){str_extract(string=x, pattern="_\\d+h")}))
+	time_data <- do.call("cbind",lapply(time_points, function(tp){
+		apply(exp_mat[,grep(tp,colnames(exp_mat))],1,mean)
+	}))
+	colnames(time_data) <- gsub("_", "", time_points)
+	
+	return(time_data)
+}
+
+reorder_clusters <- function(plot_data,rna_clusters){
+	cbind.data.frame(names=rownames(plot_data),exp=rowMeans(plot_data),cluster=rna_clusters) %>% 
+		group_by(cluster) %>% 
+		mutate(mean_exp=mean(exp)) %>% 
+		arrange(-1*mean_exp) %>% 
+		{'names<-'(.$cluster, .$names)}->reordered_clusters
+	tmp_clusters <- match(reordered_clusters,unique(reordered_clusters))
+	names(tmp_clusters) <- names(reordered_clusters)
+	
+	return(tmp_clusters)
+}
+
+plot_time_lag_cor <- function(rna_data_time_means, protein_data_time_means, 
+															label_x="RNA",
+															label_y="Protein",
+															use_genes=intersect(rownames(rna_data_time_means),rownames(protein_data_time_means)),
+															cor_method="spearman",
+															scale_color="automatic"){
+	cor_mat <- matrix(NA, nrow=ncol(rna_data_time_means), ncol=ncol(protein_data_time_means))
+	rownames(cor_mat) <- colnames(rna_data_time_means)
+	colnames(cor_mat) <- colnames(protein_data_time_means)
+	
+	use_genes <- intersect(use_genes,
+												 intersect(rownames(rna_data_time_means),rownames(protein_data_time_means)))
+	
+	for(i in colnames(rna_data_time_means)){
+		for(j in colnames(protein_data_time_means)){
+			cor_mat[i,j] <- cor(rna_data_time_means[use_genes,i], protein_data_time_means[use_genes,j], method = cor_method)
+		}
+	}
+	
+	plot_data <- cor_mat %>%
+		as.data.frame() %>%
+		rownames_to_column() %>%
+		pivot_longer(-rowname, values_to = "cor", names_to = "Protein") %>%
+		dplyr::rename(RNA=rowname) %>%
+		mutate(cor = round(cor,2),
+					 RNA = factor(RNA, levels=rev(rownames(cor_mat))),
+					 Protein = factor(Protein, levels=colnames(cor_mat))) %>%
+		as.data.frame()
+	
+	if (sum(scale_color == "automatic")) {
+		ggplot(plot_data, aes(Protein, RNA, fill = cor)) +
+			geom_tile() +
+			scale_fill_distiller(palette = "Spectral") + 
+			geom_text(aes(label = cor), size = 3) +
+			ggtitle(paste(str_to_sentence(cor_method), "correlation.", length(use_genes), "genes."))+
+			theme(panel.border = element_blank(),plot.background = element_blank(),panel.grid = element_blank())
+	} else {
+		ggplot(plot_data, aes(Protein, RNA, fill = cor)) +
+			geom_tile() +
+			scale_fill_distiller(palette = "Spectral", limits = scale_color) + 
+			geom_text(aes(label = cor), size = 3) +
+			ggtitle(paste(str_to_sentence(cor_method), "correlation.", length(use_genes), "genes."))+
+			theme(panel.border = element_blank(),plot.background = element_blank(),panel.grid = element_blank())
+	}
+	
+}
+
+whichmedian <- function(x) which.min(abs(x - median(x)))
+
+# filtering function - turns outliers into NAs to be removed
+filter_lims <- function(x){
+	l <- boxplot.stats(x)$stats[1]
+	u <- boxplot.stats(x)$stats[5]
+	
+	for (i in 1:length(x)){
+		x[i] <- ifelse(x[i]>l & x[i]<u, x[i], NA)
+	}
+	return(x)
+}
+
+remove_outliers <- function(in_counts, num_of_sds=2.5){apply(in_counts, 2, function(x){
+	x2 <- sd(x)
+	x3 <- mean(x)
+	min_val <- x3-num_of_sds*x2
+	max_val <- x3+num_of_sds*x2
+	x4 <- sapply(x, function(c){c > max_val | c < min_val | c == 0})
+	x[x4] <- NA
+	return(x)
+})}
+
+
+scatterplot_rna_prot_highlight <- function(loadings, use_genes, highlight_genes, rna_factor, prot_factor, label = FALSE){
+	prot_vals <- loadings[["protein"]][paste(use_genes,"_protein", sep=""), prot_factor]
+	rna_vals <- loadings[["rna"]][paste(use_genes,"_rna", sep=""), rna_factor]
+	plot_data <- data.frame(gene=substr(names(prot_vals),1,6), protein=prot_vals, rna=rna_vals, highlight=use_genes%in%highlight_genes)
+	max_val <- max(abs(plot_data[,c("protein", "rna")]))
+	
+	
+	p1 <- ggplot(plot_data, aes(x=rna, y=protein)) +
+		geom_point(size = 1,alpha = 0.05, shape = 1) +
+		geom_point(data = plot_data[plot_data$highlight,], size = 1, shape = 21, fill = "#FF000080") +
+		{if(label == TRUE)geom_text_repel(data = plot_data[plot_data$highlight,], aes(label = uniprot_to_gene_name[gene]), segment.color = "black")}+
+		scale_fill_brewer(palette = "Spectral", direction = -1)+
+		xlim(-1*max_val,max_val) + 
+		ylim(-1*max_val,max_val) + 
+		labs(y = paste0("Protein factor ",prot_factor), x = paste0("mRNA factor ",rna_factor))+		
+		theme(legend.position="none", plot.title = element_text(size=10))
+	
+	return(p1)
+}
+
+```
+
+```{r set_up_colors}
+rna_colors <- brewer.pal(6,"OrRd")
+names(rna_colors) <- c("rna00", "rna02", "rna04", "rna06", "rna08", "rna10")
+prot_colors <- brewer.pal(5,"GnBu")
+names(prot_colors) <- c("prot00", "prot02", "prot04", "prot08", "prot10")
+combined_colors <- c(rna_colors,prot_colors)
+
+kelly_color <- "grey50"
+names(kelly_color) <- "lacal_kelly"
+
+rep_colors <- brewer.pal(n = 4, name = "Set2")
+names(rep_colors) <- c("a", "b", "c", "d")
+
+heatmap_color_scale <- colorRamp2(4:-4, colorRampPalette(brewer.pal(11,"RdYlBu"))(9))
+```
+
+```{r input_files}
+
+counts_file  <- "data/rna/counts.txt"
+annot_dir <- paste(getwd(), "dictybase_20200923/", sep="/")
+gene_uniprot_file <- paste(annot_dir, "DDB-GeneID-UniProt.txt", sep="")
+gene_info_file <- paste(annot_dir, "gene_information.txt", sep="")
+gene_annot_file <- paste(annot_dir, "gene_association.dictyBase", sep="")
+
+go_terms <- AnnotationDbi::select(GO.db, keys= keys(GO.db, keytype="GOID"), columns=c("GOID", "TERM") ) %>%
+	dplyr::rename("GO_TERM"="GOID", "GO_DESCRIPTION"="TERM")
+
+read_tsv(gene_uniprot_file) %>% rename_with(function(x){gsub(" ", "_", x)}) %>% dplyr::rename("GENE_ID"="DDB_G_ID") -> gene_uniprot
+gene_uniprot <- gene_uniprot[!duplicated(gene_uniprot$GENE_ID),]
+#These are genes that are mostly annotated as pseudogenes, but where we find expression in the proteomics
+missing_annotations <- cbind.data.frame(GENE_ID = c("DDB_G0290059","DDB_G0293770","DDB_G0282207","DDB_G0277487","DDB_G0280205","DDB_G0286455","DDB_G0291942","DDB_G0268684"),
+																				UniProt_ID = c("Q54GN0","Q54BB6","Q54SU9","Q76NU8","Q54VQ0","Q54LU1","Q54E01","Q55F07"))
+gene_uniprot$UniProt_ID[match(missing_annotations$GENE_ID,gene_uniprot$GENE_ID)] <- missing_annotations$UniProt_ID
+
+gene_id_to_uniprot <- gene_uniprot$UniProt_ID
+names(gene_id_to_uniprot) <- gene_uniprot$GENE_ID
+
+
+read_tsv(gene_annot_file, comment = "!", col_names = F) -> gene_annot
+read_tsv(gene_info_file) %>% rename_with(function(x){gsub(" ", "_", x)}) -> gene_info
+
+gene_annot_tab <- gene_info %>% 
+	full_join(gene_annot, by=c("GENE_ID"="X2")) %>% 
+	full_join(gene_uniprot, by=c("GENE_ID"="GENE_ID")) %>%
+	left_join(go_terms, by=c("X5"="GO_TERM")) %>%
+	dplyr::select(!c("X1", "X3", "X4", "X10", "X11", "X12", "X13", "X14", "X15", "X16", "X17", "Name")) %>%
+	dplyr::rename("GO_TERM"="X5", "GO_REF"="X6", "GO_EVIDENCE"="X7", "GO_TYPE"="X9", "PROT_ANNOT"="X8") 
+
+gene_info$UniProt_ID <- gene_id_to_uniprot[gene_info$GENE_ID]
+
+uniprot_to_gene_name_tmp <- gene_annot_tab %>% 
+	group_by(UniProt_ID) %>% 
+	summarise(Gene_Name = dplyr::first(Gene_Name))
+uniprot_to_gene_name <- uniprot_to_gene_name_tmp$Gene_Name
+names(uniprot_to_gene_name) <- uniprot_to_gene_name_tmp$UniProt_ID
+rm(uniprot_to_gene_name_tmp)
+
+# Gene Ontology annotations the are not informative, e.g. "Unknown", "Biological Process" etc.
+remove_annots <- c("GO:0008150", "GO:0007582", "GO:0044699", "GO:0000004", # Biological process
+									 "GO:0005575", # Cellular component
+									 "GO:0003674" # Molecular function
+)
+
+go_tab <- gene_annot_tab %>%
+	filter(GO_EVIDENCE != "IBA") %>%
+	filter(!(GO_TERM %in% remove_annots)) %>%
+	dplyr::select("UniProt_ID", "GO_TERM", "GO_TYPE", "GO_DESCRIPTION")
+
+
+go_mat_tmp <- pmin(table(go_tab$GO_DESCRIPTION, go_tab$UniProt_ID),1) # binary matrix with GO terms as rows and genes as columns, for run_enrichment 
+go_mat <- matrix(go_mat_tmp, nrow = nrow(go_mat_tmp), ncol = ncol(go_mat_tmp)) # ugly hack, fix
+colnames(go_mat) <- colnames(go_mat_tmp)
+rownames(go_mat) <- rownames(go_mat_tmp)
+rm(go_mat_tmp)
+
+# Create Gene to GO list,
+gene_to_go_list <- split(go_tab$GO_TERM, go_tab$UniProt_ID)
+gene_to_go_list <- lapply(gene_to_go_list,function(x){unique(x)})
+
+
+
+
+
+```
+
+
+# RNA-seq analysis
+
+```{r load_transcriptomics}
+
+counts <- as.matrix(read_tsv(counts_file, quote = "\"", comment = "#"))
+colnames(counts) <- gsub("merged_mapped/SI-2309-|.bam", "", colnames(counts)) 
+rownames(counts) <- counts[,1]
+counts <- counts[,-1*1:6]
+class(counts) <- "numeric"
+counts <- counts[,grep("FS146", colnames(counts))] # only use wt data
+counts <- counts[apply(counts,1,sum)>0,] # remove genes with no reads
+
+# Create metadata table, from file names
+meta_data_rna <- do.call("rbind",sapply(colnames(counts), function(x){strsplit(x, "-")})) %>%
+	data.frame() %>%
+	dplyr::rename(Genotype = X1, Time = X2, Rep = X3) %>%
+	mutate(Time = str_pad(gsub("h", "", Time), 2, pad="0")) %>%
+	mutate(sample_id = rownames(.)) %>%
+	mutate(sample_id = gsub("FS146", "wt", sample_id)) %>%
+	mutate(sample_id = gsub("-h", "_a", sample_id)) %>%
+	mutate(sample_id = gsub("-i", "_b", sample_id)) %>%
+	mutate(sample_id = gsub("-j", "_c", sample_id)) %>%
+	mutate(sample_id = gsub("-k", "_d", sample_id)) %>%
+	mutate(sample_id = gsub("-", "_", sample_id)) %>%
+	mutate(Rep = gsub("h", "a", Rep)) %>%
+	mutate(Rep = gsub("i", "b", Rep)) %>%
+	mutate(Rep = gsub("j", "c", Rep)) %>%
+	mutate(Rep = gsub("k", "d", Rep)) %>%
+	arrange(Time, Rep)
+
+# Reorder samples
+counts <- counts[, rownames(meta_data_rna)]
+
+# Reformat sample names
+colnames(counts) <- meta_data_rna$sample_id
+rownames(meta_data_rna) <- meta_data_rna$sample_id
+
+rownames(counts) <- gene_id_to_uniprot[rownames(counts)]
+counts <- aggregate(counts, list(rownames(counts)),sum)
+rownames(counts) <- counts[,1]
+counts <- counts[,-1]
+
+
+```
+
+
+## Differentially expressed genes
+
+```{r rna_de, warning=FALSE, message=FALSE, fig.width=6.8, fig.height=5, fig.align='center'}
+max_pval <- 1e-2
+
+dds <- DESeqDataSetFromMatrix(countData = counts, colData = meta_data_rna, design = formula(~ Time))
+dds <- DESeq(dds, test="LRT", reduced=~1)
+res <- results(dds)
+LFCrna <- cbind.data.frame(lfcShrink(dds, coef = "Time_02_vs_00", type = "apeglm")$log2FoldChange,
+													 lfcShrink(dds, coef = "Time_04_vs_00", type = "apeglm")$log2FoldChange,
+													 lfcShrink(dds, coef = "Time_06_vs_00", type = "apeglm")$log2FoldChange,
+													 lfcShrink(dds, coef = "Time_08_vs_00", type = "apeglm")$log2FoldChange,
+													 lfcShrink(dds, coef = "Time_10_vs_00", type = "apeglm")$log2FoldChange)
+colnames(LFCrna) <- c("2vs0","4vs0","6vs0","8vs0","10vs0")
+dev_genes <- rownames(res)[which(res$padj < max_pval)]
+
+
+
+# Do regularized log transformation, then plot all genes affected by developmental time in a heatmap
+norm_rna_data  <- vst(dds, blind=F)
+linear_rna_normalised <- t(t(2^assay(norm_rna_data))/colSums(2^assay(norm_rna_data)))*1e6
+
+out_rna_table <- cbind.data.frame(
+	gene_info[match(rownames(LFCrna),gene_info$UniProt_ID),],
+	format(LFCrna,scientific = FALSE),
+	res$padj,
+	format(linear_rna_normalised,scientific = FALSE)
+	)
+write.table(out_rna_table, "tables/rna_logFC.tsv", sep = "\t", row.names = F, col.names = T, quote = F)
+
+plot_data <- LFCrna[dev_genes,]
+k <- 4
+clust_method <- "ward.D"
+plotClust <- hclust(dist(plot_data), method = clust_method)
+
+
+
+plot_data <- plot_data[plotClust$order,]
+plotClust <- hclust(dist(plot_data), method = clust_method)
+rna_clusters <- cutree(plotClust, k = k)
+rna_clusters <- reorder_clusters(plot_data, rna_clusters)
+plot_data <- plot_data[names(rna_clusters),]
+
+clust_annot <- data.frame("cluster"=paste0("cluster",rna_clusters))
+rownames(clust_annot) <- rownames(plot_data)
+clust_colors <- brewer.pal(n = max(rna_clusters), name = "Set2")
+names(clust_colors) <- paste0("cluster",1:max(rna_clusters))
+
+rna_h <- Heatmap(plot_data, 
+								 cluster_columns = FALSE,
+								 cluster_rows = FALSE,
+								 show_row_names = FALSE,
+								 col = heatmap_color_scale, 
+								 #column_names_side = c("top"), 
+								 column_names_rot = 0,   column_names_centered = T,
+								 heatmap_legend_param = list(direction = "horizontal", 
+								 														title = "logFC",
+								 														title_gp = gpar(fontsize = 8, fontface = "bold"),
+								 														title_position = "lefttop",
+								 														labels_gp = gpar(fontsize = 8), 
+								 														grid_height = unit(3,"mm")), 
+								 row_split = clust_annot$cluster,
+								 left_annotation = rowAnnotation(cluster = clust_annot$cluster, 
+								 																width = unit(2, "mm"),
+								 																simple_anno_size_adjust = TRUE,
+								 																col = list(cluster = clust_colors), 
+								 																show_legend = F,
+								 																show_annotation_name = F), 
+								 column_names_gp = gpar(fontsize = 8), 
+								 row_title_gp = gpar(fontsize = 10)
+)
+a <- grid.grabExpr(draw(rna_h, heatmap_legend_side = "bottom"))
+
+plotdat <- cbind.data.frame(LFCrna[names(rna_clusters),],rna_clusters)
+plotdat <- pivot_longer(plotdat, cols = 1:5)
+plotdat$name <- factor(plotdat$name, levels = c("2vs0","4vs0","6vs0","8vs0","10vs0"))
+plotdat$rna_clusters <- factor(plotdat$rna_clusters, levels = c(1:k))
+plotdat %>%
+	group_by(name,rna_clusters)%>%
+	mutate(value2 = filter_lims(value))%>%
+	ggplot(aes(name,value2, fill = rna_clusters))+
+	geom_hline(yintercept = 0, lty = "33", lwd = 0.25)+
+	geom_boxplot(lwd = 0.25, outlier.shape = NA)+
+	scale_fill_manual(values = unname(clust_colors))+
+	facet_wrap(~ rna_clusters, ncol = 1, scales = "free")+
+	theme(strip.text.x = element_blank(), axis.title = element_blank(), axis.text.x = element_text(angle = 45, hjust = 1), legend.position = "none") -> b
+
+
+comb_GO <- data.frame()
+for(cluster in 1:max(rna_clusters)){
+	cat(paste("\n\n### Cluster" ,cluster, "\n\n"))
+	
+	cluster_genes <- factor(as.integer(rownames(res) %in% names(rna_clusters[rna_clusters==cluster])))
+	names(cluster_genes) <- rownames(res)
+	
+	# How many gene have any annotation?
+	genes_in_cluster <- names(cluster_genes)[cluster_genes==1]
+	genes_with_annot <- names(gene_to_go_list)
+	genes_in_cluster_with_annot <- intersect(genes_with_annot, genes_in_cluster)
+	cat(paste(length(genes_in_cluster_with_annot), "/", length(genes_in_cluster), "have annotations.\n"))
+	
+	GOdata <- new("topGOdata",
+								ontology = "BP",
+								allGenes = cluster_genes,
+								description = "",
+								nodeSize = 5,
+								gene2GO = gene_to_go_list,
+								annot = annFUN.gene2GO)
+	results_go <- runTest(GOdata, algorithm = "weight01", statistic = "fisher")
+	
+	top_go_res <- GenTable(GOdata, Fis = results_go, topNodes = 100)
+	
+	comb_GO <- rbind(comb_GO, cbind(top_go_res,"cluster" = cluster))
+}
+comb_GO$Fis <- as.numeric(comb_GO$Fis)
+comb_GO$Enrichment <- comb_GO$Significant/comb_GO$Expected
+comb_GO <- comb_GO[comb_GO$Enrichment>1,]
+
+plot_GO <- comb_GO %>% 
+  slice_min(order_by = Fis, n = 4, by = cluster)
+plot_GO <- plot_GO[-16,]
+plot_GO$logP <- -log(as.numeric(plot_GO$Fis))
+plot_GO$logP[is.na(plot_GO$logP)] <- -log(1e-7)
+plot_GO$logP[plot_GO$logP > -log(1e-8)] <- -log(1e-8)
+plot_GO$cluster <- factor(paste0("cluster",plot_GO$cluster))
+plot_GO$Term <- factor(plot_GO$Term, levels = rev(plot_GO$Term))
+c <- ggplot(plot_GO, aes(x = Term, y = logP, size = Enrichment, color = cluster))+
+	facet_wrap(~ cluster, scales = "free", ncol = 1)+
+	geom_hline(yintercept = -log(0.01), lty="dashed")+
+	geom_point(stat = 'identity')+scale_color_manual(values = clust_colors)+
+	geom_segment(aes(y = 0, yend = logP, xend = Term), size = 0.5)+
+	scale_size(range = c(0.5,3), limits = c(1,20), breaks =c(1,5,20))+
+	scale_y_continuous(limits = c(0,max(plot_GO$logP)+0.5), breaks = -log(c(0.01,1e-5,1e-8)), labels = c(0.01,1e-5,"<1e-8"))+
+	coord_flip()+
+	theme(legend.position = "none",
+				axis.text = element_text(size = 7), 
+				axis.text.x = element_text(angle = 45, hjust = 1), 
+				axis.title = element_blank(),
+				strip.text.x = element_blank())
+d <- ggarrange(a,b,c, nrow = 1, widths = c(2.5,1,2.5))
+d
+ggsave("plots/mRNA_logFC_heatmap.svg", d, "svg", width = 7.1, height = 5, units = "in", dpi = 320)
+
+
+write.table(comb_GO[comb_GO$Fis<0.01,c(1,2,7,6,3,4,5,8)], "tables/rna_GOterms.tsv", sep = "\t", row.names = F, col.names = T, quote = F)
+
+```
+
+```{r rna_pca, fig.align='center', fig.width=2.8, fig.height=2.2}
+
+ntop = 500
+rv = rowVars(as.matrix(assay(norm_rna_data)))
+select <- order(rv, decreasing = T)[seq_len(min(ntop, length(rv)))]
+mat <- t(assay(norm_rna_data)[select,])
+pca <- prcomp(mat)
+pcaMat <- data.frame(pca$x)
+pcaMat$ID <- factor(rep(seq(0,10,2),each=4))
+#pcaMat$ID <- factor(pcaMat$ID, levels = unique(pcaMat$ID[c(seq(1,length(pcaMat$ID),2),seq(2,length(pcaMat$ID),2))]))
+variances <- ((pca$sdev^2) / (sum(pca$sdev^2)))*100
+a <- ggplot(pcaMat, aes(x = PC1, y = PC2, color = ID, label = ID)) +
+	geom_text()+
+	theme_minimal()+
+	xlab(paste0("PC1: ", round(variances[1], digits = 1),"% variance"))+
+	ylab(paste0("PC2: ", round(variances[2], digits = 1),"% variance"))+
+	scale_color_brewer(palette = "Dark2")+
+	theme(legend.position = "none",title = element_text(size = 9), axis.text = element_text(size = 8))
+a
+ggsave("plots/mRNA_PCA.svg",a,width = 2.8,height = 2.2)
+
+```
+
+
+## Between sample correlation
+
+```{r rna_correlation, fig.width=6.8, fig.height=5}
+cor_matrix <- cor(x=log2(linear_rna_normalised), method = "spearman")
+rownames(cor_matrix) <- substr(rownames(cor_matrix),4,10)
+colnames(cor_matrix) <- substr(colnames(cor_matrix),4,10)
+
+#svglite("plots/rna_corr_matrix.svg",width = 6.8,height = 5)
+pheatmap(cor_matrix,
+				 cluster_cols = F, 
+				 cluster_rows = F, 
+				 scale = "none",
+				 main = "Spearman correlation between mRNA samples",
+				 use_raster = F, display_numbers = T, number_color = "black", legend = F)
+#dev.off()
+```
+
+```{r preprocess Rosengarten}
+#The Rosengarten raw fastq data was pre-processed in the same way as our RNA-seq data
+rosengarten_counts <- "data/rna/rosengarten2015_counts.txt"
+rosengarten <- as.matrix(read_tsv(file = rosengarten_counts, quote = "\"", comment = "#"))
+colnames(rosengarten) <- gsub("star_map.SRR15934|.bam", "", colnames(rosengarten))
+rownames(rosengarten) <- gene_id_to_uniprot[rosengarten[,1]]
+rosengarten <- rosengarten[,-(1:6)]
+class(rosengarten) <- "numeric"
+rosengarten <- aggregate(rosengarten, list(rownames(rosengarten)),sum)
+rownames(rosengarten) <- rosengarten[,1]
+rosengarten <- rosengarten[,-1]
+r_metadata <- data.frame("ID"=c(rbind(c(24:34),c(43:53))),
+												 "Time"=as.factor(rep(c(0:10), each=2)),
+												 "Rep"=rep(c("a","b"), 11))
+rosengarten <- rosengarten[,as.character(r_metadata$ID)]
+rds <- DESeqDataSetFromMatrix(countData = rosengarten,	colData = r_metadata, design = formula(~ Time))
+rds <- DESeq(rds, test="LRT", reduced=~1)
+rres <- results(rds)
+norm_rosengarten_data <- vst(rds, blind=F)
+
+
+
+```
+
+```{r compare_DE_rosengarten, fig.width=3.4, fig.height=2.2}
+max_pval <- 1e-2
+clust_method <- "ward.D"
+venn_colors <- c(our_DE = "#377EB8", rosengarten_DE = "#E41A1C", both_DE = "#984EA3") #Set colors for the different datasets. The names are reused to plot in the venn diagram and heatmap as well.
+
+sc_rosengarten <- scale_rows(assay(norm_rosengarten_data)) #Get z-scores of normalized counts for Rosengarten data
+colnames(sc_rosengarten) <- paste0(r_metadata$Time,"h.",r_metadata$Rep)
+sc_de_genes <- scale_rows(assay(norm_rna_data)) #Get z-scores of normalized counts for our data
+
+rosengarten_dev_genes <- rownames(rres)[rres$padj < max_pval & rownames(rres) %in% rownames(res)] #Select genes that are sigDE in rosengarten
+dev_genes_filt <- rownames(res)[res$padj < max_pval & rownames(res) %in% rownames(rres)] #Select genes that are sigDE in our data
+
+#Create 3 dataframes: combined zscores of both datasets for genes that are SigDE in both, only rosengarten zscores that are only rosengarten SigDE, and only our data zscores that are only our data SigDE
+combined_de <- cbind(
+	sc_rosengarten[na.omit(rosengarten_dev_genes[rosengarten_dev_genes %in% dev_genes_filt]),],
+	sc_de_genes[na.omit(rosengarten_dev_genes[rosengarten_dev_genes %in% dev_genes_filt]),]
+)
+rosengarten_de_only <- sc_rosengarten[rosengarten_dev_genes[!(rosengarten_dev_genes %in% dev_genes_filt)],]
+our_de_only <- sc_de_genes[dev_genes_filt[!(dev_genes_filt %in% rosengarten_dev_genes)],]
+
+#Cluster these three dataframes separately, and get the genes in the clustered order
+combined_genes_clustered <- rownames(combined_de)[hclust(dist(combined_de),method = clust_method)$order]
+rosengarten_genes_clustered <- rownames(rosengarten_de_only)[hclust(dist(rosengarten_de_only),method = clust_method)$order]
+our_genes_clustered <- rownames(our_de_only)[hclust(dist(our_de_only),method = clust_method)$order]
+
+#Combine the zscores of both datasets but plot only the genes that are SigDE in either of the datasets, with the order based on clustering. First the RosengartenOnly, then the combined and then OurDataOnly.
+plot_data <- cbind(sc_rosengarten[c(rosengarten_genes_clustered,combined_genes_clustered,our_genes_clustered),],
+									 sc_de_genes[c(rosengarten_genes_clustered,combined_genes_clustered,our_genes_clustered),])
+#Add annotations to show in which datasets these genes were SigDE
+row_annot <- data.frame("DE"=c(rep(names(venn_colors)[2],length(rosengarten_genes_clustered)), 
+															 rep(names(venn_colors)[3],length(combined_genes_clustered)), 
+															 rep(names(venn_colors)[1],length(our_genes_clustered))
+))
+row_annot$DE <- factor(row_annot$DE, levels = c("rosengarten_DE" ,"both_DE", "our_DE"))
+
+svglite("plots/mRNA_rosengarten_heatmap.svg", width = 5, height = 3.6)
+Heatmap(plot_data, name = "foo",
+				cluster_columns = FALSE,
+				cluster_rows = FALSE,
+				show_row_names = FALSE,
+				use_raster = T,
+				col = heatmap_color_scale, show_column_names = F,
+				#column_names_side = c("top"), 
+				column_names_rot = 0,   column_names_centered = T,
+				heatmap_legend_param = list(title = "zscore",
+																		labels_gp = gpar(fontsize = 6), 
+																		title_gp = gpar(fontsize = 6, fontface = "bold"), 
+																		grid_width = unit(2,"mm")),
+				top_annotation = columnAnnotation(
+					time =  c(rep(0:10,each = 2),rep(seq(0,10,2), each = 4)),
+					col = list(time = colorRamp2(c(0,5,10),c("#EAF6DF","#b2df8a","#33a02c"))), 
+					height = unit(1, "mm"),
+					simple_anno_size_adjust = TRUE,
+					annotation_legend_param = list(time = list(title = "time(h)",
+																										 title_gp = gpar(fontsize = 6, fontface = "bold"),
+																										 at = seq(0,10,2),
+																										 labels_gp = gpar(fontsize = 6),
+																										 grid_width = unit(2,"mm"))),
+					show_annotation_name = F
+				),
+				column_split = factor(c(rep("rosengarten",22),rep("our_study",24)), levels = c("rosengarten","our_study")),
+				#cluster_column_slices = FALSE,
+				#column_gap = unit(c(rep(0,10),2,rep(0,5)), "mm"),
+				row_split = row_annot$DE,
+				row_title_rot = 0,
+				left_annotation = rowAnnotation(cluster = row_annot$DE, 
+																				col = list(cluster = venn_colors), 
+																				width = unit(1, "mm"),
+																				simple_anno_size_adjust = TRUE,
+																				show_legend = F,
+																				show_annotation_name = F),
+				column_title_gp = gpar(fontsize = 8), 
+				row_title_gp = gpar(fontsize =8)
+)
+
+decorate_heatmap_body("foo",{grid.rect(gp = gpar(fill = "transparent", col = "black", lwd = 1))}, slice = 1)
+decorate_heatmap_body("foo",{grid.rect(gp = gpar(fill = "transparent", col = "black", lwd = 1))}, slice = 2)
+decorate_heatmap_body("foo",{grid.rect(gp = gpar(fill = "transparent", col = "black", lwd = 1))},row_slice = 2, column_slice = 2)
+decorate_heatmap_body("foo",{grid.rect(gp = gpar(fill = "transparent", col = "black", lwd = 1))}, row_slice = 3, column_slice = 2)
+#dev.off()
+#svglite("plots/rosengarten_venn.svg", width = 3, height = 3)
+venn_data <- c(length(our_genes_clustered),
+							 length(rosengarten_genes_clustered),
+							 length(combined_genes_clustered))
+names(venn_data) <- c(names(venn_colors[1:2]),paste0(names(venn_colors[1]),"&",names(venn_colors[2])))
+plot(euler(venn_data),fills=venn_colors,labels = c())
+#dev.off()
+
+
+milestones <- read.table("data/milestone_genes.txt", sep = "\t", header = FALSE)
+milestones$V1 <- gene_id_to_uniprot[milestones$V1]
+milestones <- na.omit(milestones[,1:5])
+milestone_IDs <- intersect(milestones$V1[
+	milestones$V3%in%c("noagg","ripple","lag","tag")
+	], rownames(sc_de_genes))
+row_annot <- data.frame(DE = milestones$V4[match(milestone_IDs, milestones$V1)],
+												dir = milestones$V5[match(milestone_IDs, milestones$V1)])
+row_annot$DE <- factor(row_annot$DE, levels = c("noagg","ripple","lag","tag","tip","slug","Mhat","cul","FB"))
+
+up_down_colors <- c(down = "#377EB8", up = "#E41A1C")
+
+#svglite("plots/milestones_RNA.svg",width = 3.5, height = 2.1)
+Heatmap(sc_de_genes[milestone_IDs,], name = "zscore",
+				cluster_columns = FALSE,
+				cluster_rows = FALSE,
+				show_row_names = FALSE,
+				use_raster = T,
+				col = heatmap_color_scale, show_column_names = F,
+				row_split = row_annot$DE, row_title_rot = 0,
+				heatmap_legend_param = list(title = "zscore",
+																		labels_gp = gpar(fontsize = 6), 
+																		title_gp = gpar(fontsize = 6, fontface = "bold"), 
+																		grid_width = unit(2,"mm")),
+				left_annotation = rowAnnotation(cluster = row_annot$dir, 
+																				col = list(cluster = up_down_colors), 
+																				width = unit(1, "mm"),
+																				simple_anno_size_adjust = TRUE,
+																				show_legend = F,
+																				show_annotation_name = F),
+				top_annotation = columnAnnotation(
+					time =  rep(seq(0,10,2), each = 4),
+					col = list(time = colorRamp2(c(0,5,10),c("#EAF6DF","#b2df8a","#33a02c"))), 
+					height = unit(1, "mm"),
+					simple_anno_size_adjust = TRUE,
+					annotation_legend_param = list(time = list(title = "time(h)",
+																										 title_gp = gpar(fontsize = 6, fontface = "bold"),
+																										 at = seq(0,10,2),
+																										 labels_gp = gpar(fontsize = 6),
+																										 grid_width = unit(2,"mm"))),
+					show_annotation_name = F
+				))
+#dev.off()
+nrow(sc_de_genes[milestone_IDs,])
+```
+
+
+# Proteomics analysis
+
+```{r load_protein_data, fig.width=2.1, fig.height=2.1}
+mass_spec_file <- "data/protein/fragpipe/combined_protein.tsv"
+conv <- "dictybase_20200923/DDB-GeneID-UniProt.txt"
+meta_data_protein <- read.table("data/protein/index_ms.tsv", header = T, row.names = 1)
+meta_data_protein <- meta_data_protein %>% 
+	filter(strain == "wt") %>%
+	mutate(sample_id = paste(strain, "_",  timepoint, "h_", biorep) %>% gsub(" ", "", .)) %>%
+	mutate(timepoint = str_pad(timepoint, 2, pad="0")) %>%
+	dplyr::rename(Genotype = strain, Time = timepoint, Rep = biorep)
+rownames(meta_data_protein) <- meta_data_protein$sample_id
+
+mass_spec <- as.matrix(read_tsv(mass_spec_file, quote = "", comment = "#"))[,c(2,75:77,81:89,78:80)]
+rownames(mass_spec) <- mass_spec[,1]
+mass_spec <- mass_spec[,-1]
+class(mass_spec) <- "numeric"
+colnames(mass_spec) <- meta_data_protein$sample_id
+mass_spec <- mass_spec[rownames(mass_spec)%in%gene_id_to_uniprot,]
+mass_spec_zero <- mass_spec
+mass_spec[mass_spec == 0] <- NA
+non_imputed_proteins <- rownames(na.omit(mass_spec))
+
+min_no_na <- 3 # require at least this many non NA values for any branch (i.e. time point)
+branch_list <- list(grep("_0h",colnames(mass_spec)),
+										grep("_2h",colnames(mass_spec)),
+										grep("_4h",colnames(mass_spec)),
+										grep("_8h",colnames(mass_spec)),
+										grep("_10h",colnames(mass_spec)))
+
+non_na_samples <-	apply(mass_spec,1,
+												function(x){
+													max(sapply(branch_list, function(b){length(which(!is.na(x[b])))}))
+												})
+
+#mass_spec_impute <- as.matrix(impute.MinProb(log2(mass_spec[non_na_samples>=min_no_na,])))
+#write.table(mass_spec_impute, "tables/protein_log2_raw.tsv", sep = "\t", row.names = T, col.names = T, quote = F)
+mass_spec_impute <- as.matrix(read.table("tables/protein_log2_raw.tsv", sep = "\t", header = T, row.names = 1))
+
+linear_mass_spec_impute <- t(t(2^mass_spec_impute)/colSums(2^mass_spec_impute))*1e6
+
+
+a <- rownames(na.omit(mass_spec))[rownames(na.omit(mass_spec)) %in% gene_uniprot$UniProt_ID]
+b <- rownames(mass_spec_impute)[rownames(mass_spec_impute) %in% gene_uniprot$UniProt_ID]
+c <- rownames(mass_spec)[rownames(mass_spec) %in% gene_uniprot$UniProt_ID]
+
+df <- data.frame(uniprotID = na.omit(unique(gene_uniprot$UniProt_ID)), msQuant = "not identified")
+rownames(df) <- df$uniprotID
+df$msQuant[match(c,df$uniprotID)] <- "quantified in some replicates"
+df$msQuant[match(b,df$uniprotID)] <- "quantified across all replicates after imputation"
+df$msQuant[match(a,df$uniprotID)] <- "quantified across all replicates"
+
+table(df$msQuant)
+
+
+mean_rna_expression <- round(rowMeans(assay(norm_rna_data)),0)
+
+df$rnaQuant <- 0
+df$rnaQuant[match(names(mean_rna_expression[names(mean_rna_expression)%in%df$uniprotID]), df$uniprotID)] <- mean_rna_expression[names(mean_rna_expression)%in%df$uniprotID]
+
+df <- df[order(match(df$msQuant,c("not identified","quantified in some replicates","quantified across all replicates after imputation","quantified across all replicates")),df$rnaQuant, decreasing = T),]
+df$number <- 1:nrow(df)
+
+
+col_fun1 <- colorRamp2(c(5, 7, 9, 11), c("#0571b0", "#92c5de", "#f4a582","#ca0020"))
+sel_rows <- seq(1, nrow(df), 10)
+
+subs_df <- df[sel_rows,]
+
+circos.clear()
+#svglite("plots/donut.svg", width = 2.6, height = 2.6)
+circos.par(start.degree = 90, gap.degree = c(0,5,0,5)[1:length(unique(subs_df$msQuant))])
+circos.heatmap.initialize(matrix(subs_df$rnaQuant),
+													split = factor(subs_df$msQuant, levels = unique(subs_df$msQuant)),
+													cluster = F)
+circos.track(ylim = range(subs_df$rnaQuant), bg.col = c("#252525","#636363","#cccccc","#f7f7f7"), track.height = 0.4, bg.lwd = 1)
+set_track_gap(mm_h(2))
+circos.heatmap(matrix(subs_df$rnaQuant),
+							 split = factor(subs_df$msQuant, levels = unique(subs_df$msQuant)),
+							 cluster = F,
+							 col = col_fun1, bg.border = "black", bg.lwd = 1, track.height = 0.2)
+
+#dev.off()
+```
+
+```{r prot_expression_missing_values, fig.width=3.2, fig.height=2.2}
+pivot_longer(data.frame(mass_spec_zero), cols = everything(), )%>%
+	mutate(uniprotID= rep(rownames(mass_spec_zero),each = 15))%>%
+	group_by(uniprotID)%>%
+	mutate(missing_vals = sum(value==0),
+				 log_max_val = log(max(value)+1))%>%
+	distinct(uniprotID, .keep_all = TRUE)%>%
+	filter(missing_vals < 15)%>%
+	#mutate(missing_vals = factor(missing_vals, levels = 0:13))%>%
+	ggplot(aes(x = log_max_val, group = missing_vals, fill = missing_vals))+
+	geom_area(aes(y = ..count..), stat = "bin", bins = 20, col = "black")+
+	labs( x = "log(max. quantfication)")+
+	scale_fill_viridis_c("Missing values\nper protein", direction = -1, breaks = c(0,4,8,12))->a
+ggsave("plots/prot_expression_missing_vals.svg",a,"svg",width = 3.2,height = 2.2)
+
+```
+
+## Differentially expressed proteins
+
+```{r protein_de, warning=FALSE, message=FALSE, fig.width=6.8, fig.height=3.4, fig.align='center'}
+max_pval <- 0.01
+
+design <- model.matrix(~ Time, data=meta_data_protein)
+
+# Limma model fitting and F-test.
+fit <- lmFit(mass_spec_impute, design)
+fit2 <- eBayes(fit)
+
+# Proteins regulated by developmental time
+tt_dev <- topTable(fit2, coef=2:5, number=nrow(mass_spec_impute))
+LFCprot <- tt_dev[,1:4]
+LFCprot <- na.omit(LFCprot)
+LFCprot <- LFCprot[,1:4]
+colnames(LFCprot) <- c("2vs0","4vs0","8vs0","10vs0")
+
+
+dev_prot <- rownames(tt_dev)[tt_dev$adj.P.Val < max_pval 
+														 #& apply(abs(LFCprot[,1:4]), 1, max) > 1
+]
+
+
+out_prot_table <- cbind.data.frame(
+	gene_info[match(rownames(LFCprot),gene_info$UniProt_ID),],
+	format(LFCprot,scientific = FALSE),
+	tt_dev$adj.P.Val,
+	format(linear_mass_spec_impute,scientific = FALSE)
+	)
+write.table(out_prot_table, "tables/prot_logFC.tsv", sep = "\t", row.names = F, col.names = T, quote = F)
+
+common_expressed <- intersect(rownames(mass_spec_impute),rownames(counts))
+gene_numbers <-	data.frame(
+	name=c("all protein coding genes",
+				 "quantified transcripts","DE transcripts","% DE of quantified transcripts",
+			 	 "quantified proteins","DE proteins", "% DE of quantified proteins", 
+				 "genes with quantified transcript and protein (common genes)", "common genes with DE transcript and protein", "common genes with DE transcript or protein"),
+													 
+	number=c(length(na.omit(unique(gene_id_to_uniprot))), 
+					 nrow(counts),length(dev_genes),round(length(dev_genes)/nrow(counts)*100),
+					 nrow(mass_spec_impute),length(dev_prot),round(length(dev_prot)/nrow(mass_spec_impute)*100),
+					 length(common_expressed),length(intersect(common_expressed,intersect(dev_prot,dev_genes))),
+					 length(intersect(common_expressed,union(dev_prot,dev_genes))))
+)
+
+
+plot_data <- LFCprot[dev_prot,]
+
+k <- 3
+clust_method <- "ward.D"
+plotClust <- hclust(dist(plot_data), method = clust_method)
+plot_data <- plot_data[plotClust$order,]
+plotClust <- hclust(dist(plot_data), method = clust_method)
+prot_clusters <- cutree(plotClust, k = k)
+prot_clusters <- reorder_clusters(plot_data, prot_clusters)
+plot_data <- plot_data[names(prot_clusters),]
+
+clust_annot <- data.frame("cluster"=paste0("cluster",prot_clusters))
+rownames(clust_annot) <- rownames(plot_data)
+clust_colors <- brewer.pal(n = max(prot_clusters), name = "Set2")
+names(clust_colors) <- paste0("cluster",1:max(prot_clusters))
+
+prot_h <- Heatmap(plot_data, 
+									cluster_columns = FALSE,
+									cluster_rows = FALSE,
+									show_row_names = FALSE,
+									col = heatmap_color_scale, 
+									#column_names_side = c("top"), 
+									column_names_rot = 0,   column_names_centered = T,
+									heatmap_legend_param = list(direction = "horizontal", 
+																							title = "logFC",
+																							title_gp = gpar(fontsize = 8, fontface = "bold"),
+																							title_position = "lefttop",
+																							labels_gp = gpar(fontsize = 8), 
+																							grid_height = unit(3,"mm")), 
+									row_split = clust_annot$cluster,
+									left_annotation = rowAnnotation(cluster = clust_annot$cluster, 
+																									width = unit(2, "mm"),
+																									simple_anno_size_adjust = TRUE,
+																									col = list(cluster = clust_colors), 
+																									show_legend = F,
+																									show_annotation_name = F), 
+									column_names_gp = gpar(fontsize = 8), 
+									row_title_gp = gpar(fontsize = 10)
+)
+a <- grid.grabExpr(draw(prot_h, heatmap_legend_side = "bottom"))
+
+plotdat <- cbind.data.frame(LFCprot[names(prot_clusters),],prot_clusters)
+plotdat <- pivot_longer(plotdat, cols = 1:4)
+plotdat$name <- factor(plotdat$name, levels = c("2vs0","4vs0","6vs0","8vs0","10vs0"))
+plotdat$prot_clusters <- factor(plotdat$prot_clusters, levels = c(1:k))
+plotdat %>%
+	group_by(name,prot_clusters)%>%
+	mutate(value2 = filter_lims(value))%>%
+	ggplot(aes(name,value2, fill = prot_clusters))+
+	geom_hline(yintercept = 0, lty = "33", lwd = 0.25)+
+	geom_boxplot(lwd = 0.25, outlier.shape = NA)+
+	scale_fill_manual(values = unname(clust_colors))+
+	facet_wrap(~ prot_clusters, ncol = 1, scales = "free")+
+	theme(strip.text.x = element_blank(), axis.title = element_blank(), axis.text.x = element_text(angle = 45, hjust = 1), legend.position = "none") -> b
+
+
+comb_GO <- data.frame()
+for(cluster in 1:max(prot_clusters)){
+	cat(paste("\n\n### Cluster" ,cluster, "\n\n"))
+	
+	cluster_genes <- factor(as.integer(rownames(tt_dev) %in% names(prot_clusters[prot_clusters==cluster])))
+	names(cluster_genes) <- rownames(tt_dev)
+	
+	# How many gene have any annotation?
+	genes_in_cluster <- names(cluster_genes)[cluster_genes==1]
+	genes_with_annot <- names(gene_to_go_list)
+	genes_in_cluster_with_annot <- intersect(genes_with_annot, genes_in_cluster)
+	cat(paste(length(genes_in_cluster_with_annot), "/", length(genes_in_cluster), "have annotations.\n"))
+	
+	GOdata <- new("topGOdata",
+								ontology = "BP",
+								allGenes = cluster_genes,
+								description = "",
+								nodeSize = 5,
+								gene2GO = gene_to_go_list,
+								annot = annFUN.gene2GO)
+	results_go <- runTest(GOdata, algorithm = "weight01", statistic = "fisher")
+	
+	top_go_res <- GenTable(GOdata, Fis = results_go, topNodes = 100)
+	
+	comb_GO <- rbind(comb_GO, cbind(top_go_res,"cluster" = cluster))
+}
+comb_GO$Fis <- as.numeric(comb_GO$Fis) 
+comb_GO$Enrichment <- comb_GO$Significant/comb_GO$Expected
+comb_GO <- comb_GO[comb_GO$Enrichment>1,]
+
+plot_GO <- comb_GO %>% 
+  slice_min(order_by = Fis, n = 4, by = cluster)
+
+plot_GO$logP <- -log(as.numeric(plot_GO$Fis))
+plot_GO$logP[is.na(plot_GO$logP)] <- -log(1e-7)
+plot_GO$cluster <- factor(paste0("cluster",plot_GO$cluster))
+plot_GO$Term <- factor(plot_GO$Term, levels = rev(plot_GO$Term))
+c <- ggplot(plot_GO, aes(x = Term, y = logP, size = Enrichment, color = cluster))+
+	facet_wrap(~ cluster, scales = "free", ncol = 1)+
+	geom_hline(yintercept = -log(0.01), lty="dashed")+
+	geom_point(stat = 'identity')+scale_color_manual(values = clust_colors)+
+	geom_segment(aes(y = 0, yend = logP, xend = Term), size = 0.5)+
+	scale_size(range = c(0.5,3),limits = c(1,20), breaks =c(1,5,20))+
+	scale_y_continuous(limits = c(0,max(plot_GO$logP)+0.5), breaks = -log(c(0.01,1e-04,1e-06,1e-08)), labels = c(0.01,"1e-4","1e-6","1e-8"))+
+	coord_flip()+
+	theme(legend.position = "none", 
+				axis.text = element_text(size = 7), 
+				axis.text.x = element_text(angle = 45, hjust = 1),
+				axis.title = element_blank(),
+				strip.text.x = element_blank())
+
+d <- ggarrange(a,b,c, nrow = 1, widths = c(2.5,1,4))
+d
+
+ggsave("plots/prot_logFC_heatmap.svg", d, "svg", width = 6.8, height = 3.4, units = "in")
+
+write.table(comb_GO[comb_GO$Fis<0.01,c(1,2,7,6,3,4,5,8)], "tables/prot_GOterms.tsv", sep = "\t", row.names = F, col.names = T, quote = F)
+
+```
+
+
+## PCA
+
+```{r prot_pca, fig.align='center', fig.width=2.8, fig.height=2.2}
+
+ntop = 300
+rv = rowVars(as.matrix(mass_spec_impute))
+select <- order(rv, decreasing = T)[seq_len(min(ntop, length(rv)))]
+mat <- t(mass_spec_impute[select,])
+pca <- prcomp(mat)
+pcaMat <- data.frame(pca$x)
+pcaMat$ID <- factor(rep(c(0,2,4,8,10), each = 3))
+#pcaMat$ID <- factor(pcaMat$ID, levels = unique(pcaMat$ID[c(seq(1,length(pcaMat$ID),2),seq(2,length(pcaMat$ID),2))]))
+variances <- ((pca$sdev^2) / (sum(pca$sdev^2)))*100
+a <- ggplot(pcaMat, aes(x = PC1, y = PC2, color = ID, label = ID)) +
+	geom_text()+
+	theme_minimal()+
+	xlab(paste0("PC1: ", round(variances[1], digits = 1),"% variance"))+
+	ylab(paste0("PC2: ", round(variances[2], digits = 1),"% variance"))+
+	scale_color_manual(values = brewer.pal(6, "Dark2")[-4])+
+	theme(legend.position = "none",title = element_text(size = 9), axis.text = element_text(size = 8))
+a
+ggsave("plots/prot_PCA.svg",a,width = 2.8,height = 2.2)
+
+```
+
+## Between sample correlation
+
+```{r prot_correlation}
+cor_matrix <- cor(x=mass_spec_impute, method = "spearman")
+rownames(cor_matrix) <- substr(rownames(cor_matrix),4,10)
+colnames(cor_matrix) <- substr(colnames(cor_matrix),4,10)
+
+#svglite("plots/prot_corr_matrix.svg",width = 6.8,height = 3.5)
+pheatmap(cor_matrix,
+				 cluster_cols = F, 
+				 cluster_rows = F, 
+				 scale = "none",
+				 main = "Spearman correlation between protein samples",
+				 use_raster = F, display_numbers = T, number_color = "black", legend = F)
+#dev.off()
+```
+
+```{r}
+
+plotdat <- scale_rows(linear_mass_spec_impute)
+
+milestone_IDs <- intersect(milestones$V1[
+	milestones$V3%in%c("noagg","ripple","lag","tag")
+	], rownames(plotdat))
+row_annot <- data.frame(DE = milestones$V4[match(milestone_IDs, milestones$V1)],
+												dir = milestones$V5[match(milestone_IDs, milestones$V1)])
+row_annot$DE <- factor(row_annot$DE, levels = c("noagg","ripple","lag","tag","tip","slug","Mhat","cul","FB"))
+
+up_down_colors <- c(down = "#377EB8", up = "#E41A1C")
+
+#svglite("plots/milestones_prot.svg", width = 3.8, height = 3)
+Heatmap(plotdat[milestone_IDs,], name = "zscore",
+				cluster_columns = FALSE,
+				cluster_rows = FALSE,
+				show_row_names = FALSE,
+				use_raster = T,
+				col = heatmap_color_scale, show_column_names = F,
+				row_split = row_annot$DE, row_title_rot = 0,
+				heatmap_legend_param = list(title = "zscore",
+																		labels_gp = gpar(fontsize = 6), 
+																		title_gp = gpar(fontsize = 6, fontface = "bold"), 
+																		grid_width = unit(2,"mm")),
+				left_annotation = rowAnnotation(cluster = row_annot$dir, 
+																				col = list(cluster = up_down_colors), 
+																				width = unit(1, "mm"),
+																				simple_anno_size_adjust = TRUE,
+																				show_legend = F,
+																				show_annotation_name = F),
+				top_annotation = columnAnnotation(
+					time =  rep(c(0,2,4,8,10), each = 3),
+					col = list(time = colorRamp2(c(0,5,10),c("#EAF6DF","#b2df8a","#33a02c"))), 
+					height = unit(1, "mm"),
+					simple_anno_size_adjust = TRUE,
+					annotation_legend_param = list(time = list(title = "time(h)",
+																										 title_gp = gpar(fontsize = 6, fontface = "bold"),
+																										 at = seq(0,10,2),
+																										 labels_gp = gpar(fontsize = 6),
+																										 grid_width = unit(2,"mm"))),
+					show_annotation_name = F
+				))
+#dev.off()
+```
+
+
+## Comparison to other data
+
+```{r Compare to Lacal kelly, fig.width=4.8, fig.height=3}
+#Load kelly data and impute missing values as previously
+kelly <- tibble(read.csv(file = "data/protein/Kelly_proteomics.csv", sep = ";")[,c(5,31:42)])
+
+#Generate design matrix for Limma
+cond <- as.factor(rep(c("dev","ctrl"), each = 6))
+time <- as.factor(rep(c(8,0.5), 2, each = 3))
+lev <- as.factor(paste0(cond,time))
+design <- model.matrix(~0+lev)
+colnames(design) <- gsub("lev","",colnames(design))
+
+colnames(kelly) <- c("uniprotID",paste0(cond,time,paste0("_",1:3)))
+kelly%>% 
+	separate_wider_delim(uniprotID,delim = ";",names = c("A",NA), too_few = "align_start",too_many = "drop")%>%
+	mutate(across(everything(), ~ replace(., . == "Filtered", 0)))%>%
+	mutate(across(-c(A), as.numeric))%>%
+	group_by(A)%>%
+	summarise(across(everything(), sum))%>%
+	column_to_rownames(var = "A") -> kelly
+kelly <- kelly[rownames(kelly)%in%gene_id_to_uniprot,]
+kelly[kelly == 0] <- NA
+
+branchListR <- list(1:3,4:6,7:9,10:12)
+
+non_na_samples <-	apply(kelly,1,
+													function(x){
+														max(sapply(branchListR, function(b){length(which(!is.na(x[b])))}))
+													})
+kelly_impute <- as.matrix(impute.MinProb(log2(kelly[non_na_samples>=min_no_na,])))
+
+
+
+
+#Limma protein analysis as previously
+fit <- lmFit(kelly_impute, design)
+fit2 <- contrasts.fit(fit, makeContrasts("dev0.5-ctrl0.5","dev8-ctrl8", levels = design))
+fit2 <- eBayes(fit2)
+ke_dev <- data.frame(topTable(fit2, number=nrow(kelly_impute)))
+LFCke <- ke_dev[,1:2]
+
+
+ke_dev_prot <- rownames(ke_dev)[ke_dev$adj.P.Val < max_pval 
+																		#& abs(ke_dev[,1]) > 1
+]
+
+ke_zscores <- data.frame(scale_rows(kelly_impute))[,c(10:12,4:6,7:9,1:3)]
+prot_zscores <- data.frame(scale_rows(mass_spec_impute))
+
+combined_de <- cbind(
+	ke_zscores[ke_dev_prot[ke_dev_prot %in% dev_prot],],
+	prot_zscores[ke_dev_prot[ke_dev_prot %in% dev_prot],]
+)
+ke_de_only <- ke_zscores[ke_dev_prot[!(ke_dev_prot %in% dev_prot)],]
+our_de_only <- prot_zscores[dev_prot[!(dev_prot %in% ke_dev_prot)],]
+
+#Cluster these three dataframes separately, and get the genes in the clustered order
+combined_prot_clustered <- rownames(combined_de)[hclust(dist(combined_de),method = clust_method)$order]
+kelly_prot_clustered <- rownames(ke_de_only)[hclust(dist(ke_de_only),method = clust_method)$order]
+our_prot_clustered <- rownames(our_de_only)[hclust(dist(our_de_only),method = clust_method)$order]
+
+
+
+plot_data <- na.omit(as.matrix(cbind(LFCke[c(kelly_prot_clustered,combined_prot_clustered,our_prot_clustered),],
+														 LFCprot[c(kelly_prot_clustered,combined_prot_clustered,our_prot_clustered),])))
+#svglite("plots/protein_kelly_heatmap_LFC.svg", width = 3.8, height = 2.2)
+Heatmap(plot_data, name = "foo",
+				cluster_columns = FALSE,
+				cluster_rows = TRUE,
+				show_row_names = FALSE,
+				use_raster = T,
+				col = heatmap_color_scale, show_column_names = F,
+				column_names_side = c("top"), 
+				column_names_rot = 0,   column_names_centered = T,
+				heatmap_legend_param = list(title = "logFC",
+								  									labels_gp = gpar(fontsize = 6), 
+																		title_gp = gpar(fontsize = 6, fontface = "bold"), 
+																		grid_width = unit(3,"mm")),
+				top_annotation = columnAnnotation(
+					time =  c(c(0.5,8),seq(2,10,2)[-3]),
+					col = list(time = colorRamp2(c(0,5,10),c("#EAF6DF","#b2df8a","#33a02c"))), 
+					height = unit(1, "mm"),
+    			simple_anno_size_adjust = TRUE,
+					annotation_legend_param = list(time = list(title = "time(h)",
+																										 title_gp = gpar(fontsize = 6, fontface = "bold"),
+																										 at = seq(0,10,2),
+																										 labels_gp = gpar(fontsize = 6),
+																										 grid_width = unit(3,"mm"))),
+					show_annotation_name = F
+					),
+				column_split = factor(c(rep("kelly",2),rep("our_study",4)), levels = c("kelly","our_study")),
+				#cluster_column_slices = FALSE,
+				#column_gap = unit(c(rep(0,10),2,rep(0,5)), "mm"),
+				#row_split = row_annot$DE,
+				row_title_rot = 0,
+# 				left_annotation = rowAnnotation(cluster = row_annot$DE, 
+# 																				col = list(cluster = venn_prot_colors), 
+# 																				width = unit(1, "mm"),
+#     																		simple_anno_size_adjust = TRUE,
+# 																				show_legend = F,
+# 																				show_annotation_name = F),
+				column_title_gp = gpar(fontsize = 8), 
+				row_title_gp = gpar(fontsize =8)
+)
+
+#dev.off()
+
+```
+# Combined analysis
+## Across genes correlation
+
+```{r Across genes correlation, fig.width=2.8, fig.height=2.8}
+
+# convert protein ids to gene ids
+use_genes <- intersect(rownames(linear_rna_normalised), rownames(linear_mass_spec_impute))
+
+protein_data <- t(t(linear_mass_spec_impute[use_genes,])/(colSums(linear_mass_spec_impute[use_genes,])))*1e6
+protein_data_log <- log2(protein_data)
+rna_data <- t(t(linear_rna_normalised[use_genes,])/(colSums(linear_rna_normalised[use_genes,])))*1e6
+rna_data_log <- log2(rna_data)
+
+rna_data_means <- time_point_means(rna_data)
+prot_data_means <- time_point_means(protein_data)
+
+
+for (i in c("0h","2h","4h","8h","10h")) {
+	plotdat <- data.frame("prot_fraction"=prot_data_means[,i], "rna_fraction"=rna_data_means[,i])
+	model <- lmodel2(log10(prot_fraction) ~ log10(rna_fraction), plotdat, range.y = "interval", range.x = "interval")
+	print(model$regression.results[4,2])
+	x <- densCols(log10(plotdat$rna_fraction), log10(plotdat$prot_fraction), colramp = colorRampPalette(c("black","white")))
+	plotdat$dens <- col2rgb(x)[1,] / 256
+	ggplot(plotdat[order(plotdat$dens),], aes(rna_fraction,prot_fraction, col=dens))+
+		geom_point(shape = 16, alpha = 1, size = 1)+ 
+		geom_abline(slope = 1, col="red")+
+		geom_abline(slope = model$regression.results[4,3], intercept = model$regression.results[4,2], lty="dashed")+
+		scale_x_log10()+#limits = c(1e-6,1e-2))+
+		scale_y_log10()+#limits = c(1e-6,1e-2))+
+		scale_color_viridis_c("density", limits = c(0,1), breaks = c(0.1,0.9), labels = c("low","high"))+
+		guides(color=guide_colorbar(ticks.colour = "NA"))+
+		coord_cartesian(xlim = c(1,1e4),ylim = c(1,1e4))+
+		ggtitle(paste0(
+		"spearman: ", signif(cor.test(x = plotdat$prot_fraction, y = plotdat$rna_fraction, method = "spearman")$estimate, digits = 3),
+		" | slope: ", signif(model$regression.results[4,3], digits = 3)
+		))+
+		annotation_logticks()+
+		theme(legend.key.height = unit(2, "mm"), legend.position = c(0.15,0.85), legend.background = element_blank())->a[[i]]
+}
+a[["0h"]]
+a[["2h"]]
+a[["4h"]]
+a[["8h"]]
+a[["10h"]]
+
+ggsave("plots/correlation_across_genes.svg",a[["0h"]],"svg",width = 2.8, height = 2.8)
+ggsave("plots/correlation_across_genes_2h.svg",a[["2h"]],"svg",width = 2.8, height = 2.8)
+ggsave("plots/correlation_across_genes_4h.svg",a[["4h"]],"svg",width = 2.8, height = 2.8)
+ggsave("plots/correlation_across_genes_8h.svg",a[["8h"]],"svg",width = 2.8, height = 2.8)
+ggsave("plots/correlation_across_genes_10h.svg",a[["10h"]],"svg",width = 2.8, height = 2.8)
+
+
+
+which.min(abs(cumsum(sort(prot_data_means[,1]))-0.1))
+which.min(abs(cumsum(sort(prot_data_means[,1], decreasing = T))-0.1))
+
+which.min(abs(cumsum(sort(rna_data_means[,1]))-0.1))
+which.min(abs(cumsum(sort(rna_data_means[,1], decreasing = T))-0.1))
+
+plotdat <- rbind(
+	data.frame("y"=c(0,cumsum(sort(prot_data_means[,1], decreasing = T))), "x"=0:nrow(prot_data_means), "type"="protein"),
+	data.frame("y"=c(0,cumsum(sort(rna_data_means[,1], decreasing = T))), "x"=0:nrow(rna_data_means), "type"="RNA")
+)
+ggplot(plotdat, aes(x, y, col = type))+
+	#geom_point(shape = 1, size = 0.5)+
+	geom_line()+
+	geom_hline(yintercept = 0.1, lty="dashed")+
+	geom_hline(yintercept = 0.9, lty="dashed")+
+	scale_y_continuous(breaks = seq(0,1e6,1e5))+
+	labs(x="number of genes", y ="cumulative fraction")->a
+a
+ggsave("plots/cumulative_fraction.svg",a, width = 3.4, height = 2.8)
+
+ggplot(plotdat, aes(x, y, col = type))+
+	geom_point(shape = 1, size = 0.5)+
+	geom_line()+
+	geom_hline(yintercept = 0.1, lty="dashed")+
+	geom_hline(yintercept = 0.9, lty="dashed")+
+	scale_y_continuous(breaks = seq(0,1,0.1))+
+	scale_x_continuous(breaks = seq(0,20,4))+
+	coord_cartesian(xlim = c(0,20), ylim = c(0,0.2e6))+
+	labs(x="number of genes", y ="cumulative fraction")+
+	theme(legend.position = "none")->b
+b
+ggsave("plots/cumulative_fraction_zoom.svg",b, width = 1.4, height = 1.4)
+```
+
+
+## Overall statistics
+
+### Expression ranges
+
+
+```{r expression_ranges, message=FALSE, warning=FALSE, fig.width=3.5,fig.height=2.2}
+mean_rna <- apply(assay(norm_rna_data),1,mean)
+
+hist_data <- data.frame(mean_rna_exp=mean_rna,
+												prot_exp=names(mean_rna) %in% rownames(mass_spec_impute),
+												prot_de=names(mean_rna) %in%  dev_prot)
+
+hist_data$protein <- apply(hist_data,1,
+													 function(x){
+													 	if(!x[2]){return("Not_expressed")}
+													 	if(x[2]){ return("Expressed")}
+													 })
+
+hist_data$protein <- factor(hist_data$protein, levels = c("Not_expressed","Expressed"))
+
+ggplot(hist_data, aes(x=mean_rna_exp, fill=protein)) + 
+	geom_area(aes(y = ..count..), stat = "bin", bins = 20, col = "black", lwd = 0.75)+
+	scale_fill_manual(values = brewer.pal(4, "Set2"), name = "", labels = c("protein not quantified","protein quantified"))+
+	labs(x="mean mRNA expression", y="number of mRNAs")->a
+a
+ggsave("plots/protein_quantified_rna_expression.svg",a,"svg",width = 3.5, height = 2.2)
+
+
+```
+
+## Per gene correlation
+
+```{r per_gene_cor, warning=FALSE, message=FALSE, fig.width=3.8,fig.height=2.8}
+common_samples <- intersect(colnames(rna_data),colnames(protein_data))
+
+cors <- sapply(use_genes, function(x){cor(protein_data_log[x,common_samples], rna_data_log[x,common_samples], method = "pearson" )})
+pvals <- sapply(use_genes, function(x){cor.test(protein_data_log[x,common_samples], rna_data_log[x,common_samples], method = "pearson" )$p.value})
+
+hist_data <- data.frame(correlation=cors,
+												de_prot=names(cors) %in% dev_prot,
+												de_rna=names(cors) %in% dev_genes,
+												p_value=pvals)
+
+hist_data$diff_exp <- apply(hist_data,1,
+														function(x){
+															if(all(x[2] & x[3])){return("RNA & Protein")}
+															if(all(x[2] & !x[3])){return("Protein")}
+															if(all(!x[2]& x[3])){return("RNA")}
+															if(all(!x[2]& !x[3])){return("none")}
+														})
+hist_data$diff_exp <- factor(hist_data$diff_exp, levels = c("RNA & Protein","RNA","Protein","none"))
+
+median_data <- hist_data %>% 
+	group_by(diff_exp) %>% 
+	summarise( median_val = median(correlation, na.rm=T))
+
+median_data <- rbind(median_data, hist_data %>% 
+										 	summarise( diff_exp = "all", median_val = median(correlation, na.rm=T)))
+
+
+ggplot(hist_data, aes(x=correlation)) + 
+	geom_freqpoly(binwidth = 0.1) +
+	geom_freqpoly(aes(col= diff_exp), binwidth = 0.1)+
+	xlim(-1, 1) + 
+	geom_vline(data=median_data, aes(xintercept = median_val, col = diff_exp), linetype = "dashed" ) + 
+	geom_text(data=median_data[5,], aes(label = paste0("median r = ",round(median_val,digits = 2)), x = median_val, y = 150), color = "black", size = 3, angle = 90, vjust = -.2) + 
+	scale_color_manual(values = c(brewer.pal(4, "Dark2"),"black"))+
+	labs(y = "count",x = "Pearson correlation")->a
+a
+ggsave("plots/correlation_per_gene.svg",a,"svg",width = 3.8,height = 2.8)
+
+
+ggplot(hist_data[hist_data$diff_exp=="RNA & Protein",], aes(x=correlation)) + 
+	geom_freqpoly(binwidth = 0.1, col=brewer.pal(4, "Dark2")[1]) +
+	xlim(-1, 1) + 
+	geom_vline(data=median_data[1,], aes(xintercept = median_val), linetype = "dashed", col=brewer.pal(4, "Dark2")[1]) +
+	geom_text(data=median_data[1,], aes(label = paste0("median r = ",round(median_val,digits = 2)), x = median_val, y = 40), color = "black", size = 3, angle = 90, vjust = -.2) +
+	labs(y = "count",x = "Pearson correlation")->a
+a
+ggsave("plots/correlation_per_gene_DEonly.svg",a,"svg",width = 2.3,height = 2.3)
+
+
+plot_ids <- c(names(which.max(na.omit(cors[names(cors)%in%intersect(intersect(dev_prot, dev_genes), non_imputed_proteins)]))),
+							names(whichmedian(na.omit(cors[names(cors)%in%intersect(intersect(dev_prot, dev_genes), non_imputed_proteins)]))),
+							names(which.min(na.omit(cors[names(cors)%in%intersect(intersect(dev_prot, dev_genes), non_imputed_proteins)])))
+)
+plot_id <- plot_ids[1]
+scatter_corr <- cbind.data.frame("mRNA_abundance"=rna_data[plot_id,common_samples],
+																 "protein_abundance"=protein_data[plot_id,common_samples],
+																 "time"=factor(paste0(rep(c(0,2,4,8,10),each = 3))),
+																 "sample"=factor(paste0(rep(c(0,2,4,8,10),each = 3),c("a","b","c"))))
+model <- lmodel2(log10(protein_abundance) ~ log10(mRNA_abundance), scatter_corr, range.y = "interval", range.x = "interval")
+print(ggplot(scatter_corr, aes(mRNA_abundance,protein_abundance, label = sample, color = time))+
+				geom_text(size = 3)+
+				scale_color_brewer(palette = "Set1")+
+				scale_x_log10()+
+				scale_y_log10()+
+				#geom_smooth(color = "black",linetype = "dashed", alpha = 0.5, method = lm, se = FALSE)+
+				geom_abline(slope = model$regression.results[4,3], intercept = model$regression.results[4,2], lty="dashed")+
+				labs(title = paste0(uniprot_to_gene_name[plot_id]," | pearson = ", round(cors[plot_id], 3)))+
+				theme(legend.position = "none"))->a
+a
+ggsave("plots/high_gene_correlation.svg",a,"svg",width = 2.3, height = 2.3)
+
+plot_id <- plot_ids[3]
+scatter_corr <- cbind.data.frame("mRNA_abundance"=rna_data[plot_id,common_samples],
+																 "protein_abundance"=protein_data[plot_id,common_samples],
+																 "time"=factor(paste0(rep(c(0,2,4,8,10),each = 3))),
+																 "sample"=factor(paste0(rep(c(0,2,4,8,10),each = 3),c("a","b","c"))))
+model <- lmodel2(log10(protein_abundance) ~ log10(mRNA_abundance), scatter_corr, range.y = "interval", range.x = "interval")
+print(ggplot(scatter_corr, aes(mRNA_abundance,protein_abundance, label = sample, color = time))+
+				geom_text(size = 3)+
+				scale_color_brewer(palette = "Set1")+
+				scale_x_log10()+
+				scale_y_log10()+
+				#geom_smooth(color = "black",linetype = "dashed", alpha = 0.5, method = lm, se = FALSE)+
+				geom_abline(slope = model$regression.results[4,3], intercept = model$regression.results[4,2], lty="dashed")+
+				labs(title = paste0(uniprot_to_gene_name[plot_id]," | pearson = ", round(cors[plot_id], 3)))+
+				theme(legend.position = "none"))->a
+a
+ggsave("plots/low_gene_correlation.svg",a,"svg",width = 2.3, height = 2.3)
+
+cors <- sapply(use_genes, function(x){cor(protein_data_log[x,common_samples], rna_data_log[x,common_samples], method = "pearson" )})
+cors_rep_scramble <- sapply(use_genes, function(x){cor(protein_data_log[x,common_samples], rna_data_log[x,common_samples[c(2,3,1,5,6,4,8,9,7,11,12,10,14,15,13)]], method = "pearson" )})
+cors_rep_scramble2 <- sapply(use_genes, function(x){cor(protein_data_log[x,common_samples], rna_data_log[x,common_samples[c(3,1,2,6,4,5,9,7,8,12,10,11,15,13,14)]], method = "pearson" )})
+cors_all_scramble <- sapply(use_genes, function(x){cor(protein_data_log[x,common_samples], rna_data_log[x,sample(common_samples)], method = "pearson" )})
+
+plot_id <- "Q555L5"
+scatter_corr <- cbind.data.frame("mRNA_abundance"=rna_data[plot_id,common_samples],
+																 "protein_abundance"=protein_data[plot_id,common_samples],
+																 "sample"=paste0(rep(c(0,2,4,8,10),each = 3)))
+ggplot(scatter_corr, aes(mRNA_abundance,protein_abundance, label = sample, col = "matched"))+
+	geom_text()+
+	scale_x_log10()+
+	scale_y_log10()+
+	geom_smooth(linetype = "dashed", alpha = 0.5, method = lm, se = FALSE)+
+	geom_text(data = scatter_corr[1,],aes(x = min(scatter_corr$mRNA_abundance) , y = max(scatter_corr$protein_abundance), label = paste0("Pearson = ", round(cors[plot_id], 2))), hjust = 0)+
+	geom_text(aes(mRNA_abundance[c(2,3,1,5,6,4,8,9,7,11,12,10,14,15,13)],protein_abundance, col = "rep_scramble"))+
+	geom_smooth(aes(mRNA_abundance[c(2,3,1,5,6,4,8,9,7,11,12,10,14,15,13)],protein_abundance, col = "rep_scramble"), linetype = "dashed", alpha = 0.5, method = lm, se = FALSE)+
+	geom_text(data = scatter_corr[1,],aes(x = min(scatter_corr$mRNA_abundance) , y = max(scatter_corr$protein_abundance), label = paste0("Pearson = ", round(cors_rep_scramble[plot_id], 2)), col = "rep_scramble"), hjust = 0, vjust = 2)+
+	labs(title = paste0(uniprot_to_gene_name[plot_id]))+
+	scale_color_brewer(palette = "Set1")->a
+a
+ggsave("plots/gene_correlation_scrambled.svg",a,"svg",width = 3.8,height = 2.8)
+
+box_scramble <- na.omit(rbind(cbind.data.frame(cors = cors,scramble = "matched"),cbind.data.frame(cors = cors_rep_scramble,scramble = "rep_scramble"),cbind.data.frame(cors = cors_rep_scramble2,scramble = "rep_scramble"), cbind.data.frame(cors = cors_all_scramble,scramble = "all_scramble")))
+box_scramble$scramble <- factor(box_scramble$scramble, levels = c("matched","rep_scramble","all_scramble"))
+my_comparisons <- list(c("matched","rep_scramble"),c("matched","all_scramble"))
+medians <- box_scramble %>% group_by(scramble) %>% summarise(median = median(cors))
+ggplot(box_scramble,aes(x =  scramble, y = cors, fill = scramble))+
+	geom_boxplot(outlier.shape = NA)+
+	stat_compare_means(comparisons = my_comparisons, size = 3, method = "t.test")+
+	scale_x_discrete(labels = c("matched","biological\nreplicates\nscrambled","all scrambled"))+
+	labs(y = "correlation")+
+	geom_text(data = medians, mapping = aes(x = scramble, y = median+.1, label = round(median,2)))+
+	scale_fill_brewer(palette = "Set1")+
+	theme(legend.position = "none", axis.title.x = element_blank(), axis.text.x = element_text(colour = "black"))->a
+a
+ggsave("plots/gene_correlation_boxplot_scramble.svg",a,"svg",width = 2.8,height = 2.8)
+
+out_comb_table <- cbind.data.frame(
+	gene_info[match(use_genes,gene_info$UniProt_ID),], 
+	cors[use_genes], pvals[use_genes],
+	rna_data[use_genes,common_samples], protein_data[use_genes,]
+)
+
+write.table(out_comb_table, "tables/comb_corr.tsv", sep = "\t", row.names = F, col.names = T, quote = F)
+
+
+
+```
+
+## Heatmaps
+
+```{r rna_protein_heatmap, warning=FALSE, message=FALSE, fig.align='center', fig.height=6, fig.width=6.8}
+
+both_de <- cbind(
+	LFCrna[dev_genes[dev_genes %in% dev_prot],],
+	LFCprot[dev_genes[dev_genes %in% dev_prot],]
+)
+rna_de_only <- LFCrna[dev_genes[!(dev_genes %in% dev_prot)],]
+prot_de_only <- LFCprot[dev_prot[!(dev_prot %in% dev_genes)],]
+
+both_clustered <- rownames(both_de)[hclust(dist(both_de),method = clust_method)$order]
+rna_only_clustered <- rownames(rna_de_only)[hclust(dist(rna_de_only),method = clust_method)$order]
+prot_only_clustered <- rownames(prot_de_only)[hclust(dist(prot_de_only),method = clust_method)$order]
+
+venn_rna_prot_colors <- venn_colors
+names(venn_rna_prot_colors) <- c("rna","protein","both")
+venn_data <- c(length(rna_only_clustered),
+							 length(prot_only_clustered),
+							 length(both_clustered))
+names(venn_data) <- c(names(venn_rna_prot_colors[1:2]),paste0(names(venn_rna_prot_colors[1]),"&",names(venn_rna_prot_colors[2])))
+plot(euler(venn_data),quantities = TRUE,fills=venn_rna_prot_colors)
+
+
+plot_data <- as.matrix(cbind(LFCrna[c(both_clustered),],
+														 LFCprot[c(both_clustered),]))
+
+row_annot <- data.frame("DE"=c(rep(names(venn_rna_prot_colors)[3],length(both_clustered))
+))
+
+
+
+
+nrow(plot_data)
+#svglite("plots/mRNA_protein_heatmap_DE.svg", width = 3.8, height = 3)
+Heatmap(plot_data,
+				cluster_columns = FALSE,
+				cluster_rows = T,use_raster = T,
+				show_row_names = FALSE,
+				col = heatmap_color_scale, 
+				column_names_side = c("top"), 
+				column_names_rot = 0,   column_names_centered = T, column_names_gp = gpar(fontsize = 10),
+				heatmap_legend_param = list(title = "logFC",
+																		labels_gp = gpar(fontsize = 6), 
+																		title_gp = gpar(fontsize = 6, fontface = "bold"), 
+																		grid_width = unit(3,"mm")),
+				column_split = factor(c(rep("Transcriptomics",5),rep("Proteomics",4)), levels = c("Transcriptomics","Proteomics")),
+				#cluster_column_slices = FALSE,
+				#column_gap = unit(c(rep(0,10),2,rep(0,5)), "mm"),
+				column_title_gp = gpar(fontsize = 10, fontface="bold"), 
+				row_title_gp = gpar(fontsize =8)
+)
+#dev.off()
+
+
+plot_data <- na.omit(as.matrix(cbind(LFCrna[union(dev_genes,dev_prot),],
+																		 LFCprot[union(dev_genes,dev_prot),])))
+
+row_annot <- data.frame(DE = rep("both", nrow(plot_data)))
+rownames(row_annot) <- rownames(plot_data)
+row_annot[intersect(rownames(plot_data),rna_only_clustered),] <- "rna"
+row_annot[intersect(rownames(plot_data),prot_only_clustered),] <- "protein"
+
+nrow(plot_data)
+#svglite("plots/mRNA_protein_heatmap_all.svg", width = 6.8, height = 3)
+Heatmap(plot_data,
+				cluster_columns = FALSE,
+				cluster_rows = T,use_raster = T,
+				show_row_names = FALSE,
+				col = heatmap_color_scale, 
+				column_names_side = c("top"), 
+				column_names_rot = 0,   column_names_centered = T, column_names_gp = gpar(fontsize = 10),
+				heatmap_legend_param = list(title = "logFC",
+																		labels_gp = gpar(fontsize = 8), 
+																		title_gp = gpar(fontsize = 8, fontface = "bold"), 
+																		grid_width = unit(3,"mm")),
+				column_split = factor(c(rep("Transcriptomics",5),rep("Proteomics",4)), levels = c("Transcriptomics","Proteomics")),
+				#cluster_column_slices = FALSE,
+				#column_gap = unit(c(rep(0,10),2,rep(0,5)), "mm"),
+				column_title_gp = gpar(fontsize = 10, fontface="bold"), 
+				row_title_gp = gpar(fontsize =8)
+)
+#dev.off()
+
+
+rna_prot_table <- cbind.data.frame(
+	gene_info[match(rownames(both_de),gene_info$UniProt_ID),], 
+	both_de,
+	res$padj[match(rownames(both_de),rownames(res))],
+	tt_dev$adj.P.Val[match(rownames(both_de),rownames(tt_dev))]
+)
+
+rna_prot_table <- rna_prot_table[both_clustered,]
+
+head(rna_prot_table, n = 10)
+write.table(rna_prot_table, file = "tables/rna_prot_table.tsv", sep = "\t", quote = F, row.names = T, col.names = NA)
+
+
+loomis_devgenes <- read.table("data/loomis_2015_devgenes.txt", sep = "\t", header = FALSE)
+
+
+plot_data <- cbind(sc_de_genes[common_expressed,],
+						       scale_rows(linear_mass_spec_impute[common_expressed,]))
+plot_data <- plot_data[loomis_devgenes$V1[loomis_devgenes$V1%in%rownames(plot_data)
+																					#&loomis_devgenes$V2=="agg"
+																					],]
+
+
+row_annot <- data.frame(stage = loomis_devgenes$V2[loomis_devgenes$V1%in%rownames(plot_data)])
+row_annot$stage <- factor(row_annot$stage, levels = c("agg","slug","cul"))
+
+rownames(plot_data) <- uniprot_to_gene_name[rownames(plot_data)]
+
+#svglite("plots/loomis_devgenes.svg", width = 6, height = 5)
+Heatmap(plot_data, 
+				name = "zscore",
+				cluster_columns = FALSE,
+				cluster_rows = T,
+				show_row_names = TRUE,
+				use_raster = T,
+				col = heatmap_color_scale, show_column_names = F,
+				row_split = factor(row_annot$stage, levels = c("cul","slug","agg")), 
+				column_split = factor(c(rep("Transcriptomics",24),rep("Proteomics",15)), levels = c("Transcriptomics","Proteomics")),
+				top_annotation = columnAnnotation(
+					time =  c(rep(seq(0,10,2),each = 4), rep(c(0,2,4,8,10),each = 3)),
+					col = list(time = colorRamp2(c(0,5,10),c("#EAF6DF","#b2df8a","#33a02c"))), 
+					height = unit(1, "mm"),
+    			simple_anno_size_adjust = TRUE,
+					annotation_legend_param = list(time = list(title = "time(h)",
+																										 title_gp = gpar(fontsize = 8, fontface = "bold"),
+																										 at = seq(0,10,2),
+																										 labels_gp = gpar(fontsize = 8),
+																										 grid_width = unit(3,"mm"))),
+					show_annotation_name = F),
+				heatmap_legend_param = list(title = "zscore",
+																		labels_gp = gpar(fontsize = 8), 
+																		title_gp = gpar(fontsize = 8, fontface = "bold"), 
+																		grid_width = unit(3,"mm")),
+				column_title_gp = gpar(fontsize = 10, fontface="bold"),
+				row_names_gp = gpar(fontsize = 8)
+				)
+#dev.off()
+
+```
+
+
+# Missing Proteins
+
+```{r  missing proteins by number of peptides or annotation, fig.width=3.2, fig.height=2.2}
+uniprot_data <- read.table("data/uniprot_length_annotation.tsv", sep = "\t", header = T, row.names = 1)
+all_prots <- na.omit(unique(gene_id_to_uniprot))
+
+combined_means <- cbind.data.frame(
+	"mean_rna" = apply(counts, 1, mean)[all_prots],
+	"mean_prot" = apply(linear_mass_spec_impute, 1, mean)[all_prots]
+)
+rownames(combined_means) <- all_prots
+combined_means <- combined_means %>% mutate(expressed = case_when(
+	!is.na(mean_rna)&!is.na(mean_prot)&mean_rna>1 ~ "both",
+	!is.na(mean_rna)&mean_rna>1 ~ "rna",
+	!is.na(mean_prot) ~ "protein",
+	.default = "not_expressed")
+)
+table(combined_means$expressed)
+combined_means <- cbind.data.frame(combined_means, uniprot_data[all_prots,])
+combined_means$mean_rna[is.na(combined_means$mean_rna)] <- min(na.omit(combined_means$mean_rna))/2
+combined_means$mean_prot[is.na(combined_means$mean_prot)] <- min(na.omit(combined_means$mean_prot))/2
+
+combined_means$prot_identified <- combined_means$expressed=="both"|combined_means$expressed=="protein"
+combined_means$Annotation <- factor(combined_means$Annotation, levels = 1:5)
+combined_means$expressed <- factor(combined_means$expressed, levels = c("both","protein","rna","not_expressed"))
+
+ggplot(combined_means, aes(x= prot_identified, fill=Annotation))+geom_histogram(stat="count", color = "black", width=0.75)+scale_x_discrete(labels = c("Protein \nnot identified","Protein \nidentified"))+scale_fill_brewer(palette = "RdBu")+theme(axis.title.x = element_blank(), axis.text.x = element_text(colour = "black"))->a
+a
+ggsave("plots/prot_identification_annotation.svg",a,"svg",width = 3.2,height = 2.2)
+```
+
+# Time-lag
+
+## All genes
+
+```{r time_lag_all_spearman, fig.align='center', fig.height=3.4, fig.width=3.4}
+scale_color <- c(0,0.72)
+plot_time_lag_cor(log2(rna_data_means), log2(prot_data_means), cor_method = "pearson", scale_color = scale_color)
+plot_time_lag_cor(log2(rna_data_means), log2(prot_data_means), cor_method = "spearman", scale_color = scale_color)->a
+a
+ggsave("plots/spearman_corrmatrix_all.svg",a,"svg",width = 3.4,height = 3.4)
+
+```
+
+## Differentially expressed proteins+genes
+
+```{r time_lag_de_prot_spearman, fig.align='center', fig.height=3.4, fig.width=3.4}
+de_genes_all <- intersect(dev_prot, dev_genes)
+plot_time_lag_cor(log10(rna_data_means), log10(prot_data_means), use_genes=de_genes_all, scale_color = scale_color)->a
+a
+ggsave("plots/spearman_corrmatrix_DE.svg",a,"svg",width = 3.4,height = 3.4)
+plot_time_lag_cor(log10(rna_data_means), log10(prot_data_means), use_genes=de_genes_all, cor_method = "pearson", scale_color = scale_color)
+
+```
+
+## Ratios of RNA to protein
+
+```{r Protein RNA ratio and timelag, fig.height=3, fig.width=2.3}
+intersect(
+	rownames(na.omit(remove_outliers(log2(linear_mass_spec_impute), 8))),
+	rownames(na.omit(remove_outliers(log2(linear_rna_normalised), 8)))
+) -> use_genes
+
+fractions_df <- data.frame(
+	prot_data_means,rna_data_means[,-4]
+)
+fractions <- data.frame(fractions_df[,1:5]/fractions_df[,6:10])
+fractions$geneID <- rownames(fractions)
+plotdat <- fractions %>% pivot_longer(!geneID, names_to = "timepoint", values_to = "prot_per_rna")
+plotdat$timepoint <- factor(substr(plotdat$timepoint,2,4), levels = c("0h","2h","4h","8h","10h"))
+ggplot(plotdat, aes(x = timepoint, y= prot_per_rna, fill=timepoint))+
+	geom_hline(yintercept = median(plotdat$prot_per_rna), color = "grey30", lty = "11")+
+	geom_boxplot(outlier.shape = NA, width = 0.6)+
+	ggtitle("Ratio of Protein to RNA" ,paste0(length(unique(plotdat$geneID)), " genes"))+
+	scale_y_continuous(trans="log2", 
+										 breaks = c(1/32,1/16,1/8,1/4,1/2,1,2,4,8,16,32), 
+										 labels = c("1/32","1/16","1/8","1/4","1/2","1","2","4","8","16","32"))+
+	scale_fill_manual(values = colorRampPalette(c("white","grey"))(5))+
+	coord_cartesian(ylim = c(1/64,64))+
+	labs(y = "Protein per RNA", x = "Time")+
+	theme(legend.position = "none", panel.grid = element_blank(), panel.border = element_blank(), axis.line = element_line())->a
+a
+ggsave("plots/prot_per_rna_all.svg",a,"svg",width = 2.3, height = 3)
+oneway.test(prot_per_rna ~ timepoint, data = plotdat, var.equal = T)
+pairwise.t.test(plotdat$prot_per_rna, plotdat$timepoint, p.adjust.method = "none")
+summary(glht(aov(prot_per_rna ~ timepoint, data = plotdat), linfct = mcp(timepoint = "Dunnett")))
+
+fc_cutoff <- 2
+up_genes0_10 <- rownames(rna_data_means)[apply(rna_data_means[,c("10h", "0h")],1,function(x){abs(x[1]/x[2])>=fc_cutoff})]
+down_genes0_10 <- rownames(rna_data_means)[apply(rna_data_means[,c("10h", "0h")],1,function(x){abs(x[2]/x[1])>=fc_cutoff})]
+
+up_genes0_10 <- intersect(up_genes0_10, dev_genes)
+down_genes0_10 <- intersect(down_genes0_10, dev_genes)
+upplotdat <- plotdat[plotdat$geneID%in%up_genes0_10,]
+downplotdat <- plotdat[plotdat$geneID%in%down_genes0_10,]
+ggplot(upplotdat, aes(x = timepoint, y= prot_per_rna, fill=timepoint))+
+	geom_hline(yintercept = median(plotdat$prot_per_rna), color = "grey30", lty = "11")+
+	geom_boxplot(outlier.shape = NA, width = 0.6, notch = F)+
+	ggtitle("Ratio of Protein to RNA for upregulated genes" ,paste0(length(unique(plotdat[plotdat$geneID%in%up_genes0_10,]$geneID)), " genes"))+
+	scale_y_continuous(trans="log2", 
+										 breaks = c(1/32,1/16,1/8,1/4,1/2,1,2,4,8,16,32), 
+										 labels = c("1/32","1/16","1/8","1/4","1/2","1","2","4","8","16","32"))+
+	scale_fill_manual(values = colorRampPalette(c("white","#ca0020"))(5))+
+	coord_cartesian(ylim = c(1/64,64))+
+	labs(y = "Protein per RNA", x = "Time")+
+	theme(legend.position = "none", panel.grid = element_blank(), panel.border = element_blank(), axis.line = element_line())->a
+a
+ggsave("plots/prot_per_rna_up.svg",a,"svg",width = 2.3, height = 3)
+oneway.test(prot_per_rna ~ timepoint, data = upplotdat, var.equal = T)
+pairwise.t.test(upplotdat$prot_per_rna, upplotdat$timepoint, p.adjust.method = "none")
+summary(glht(aov(prot_per_rna ~ timepoint, data = upplotdat), linfct = mcp(timepoint = "Dunnett")))
+
+ggplot(downplotdat, aes(x = timepoint, y= prot_per_rna, fill=timepoint))+
+	geom_hline(yintercept = median(plotdat$prot_per_rna), color = "grey30", lty = "11")+
+	geom_boxplot(outlier.shape = NA, width = 0.6, notch = F)+
+	ggtitle("Ratio of Protein to RNA for downregulated genes" ,paste0(length(unique(plotdat[plotdat$geneID%in%down_genes0_10,]$geneID)), " genes"))+
+	scale_y_continuous(trans="log2", 
+										 breaks = c(1/32,1/16,1/8,1/4,1/2,1,2,4,8,16,32), 
+										 labels = c("1/32","1/16","1/8","1/4","1/2","1","2","4","8","16","32"))+
+	scale_fill_manual(values = colorRampPalette(c("white","#0571b0"))(5))+
+	coord_cartesian(ylim = c(1/64,64))+
+	labs(y = "Protein per RNA", x = "Time")+
+	theme(legend.position = "none", panel.grid = element_blank(), panel.border = element_blank(), axis.line = element_line())->a
+a
+ggsave("plots/prot_per_rna_down.svg",a,"svg",width = 2.3, height = 3)
+oneway.test(prot_per_rna ~ timepoint, data = downplotdat, var.equal = T)
+pairwise.t.test(downplotdat$prot_per_rna, downplotdat$timepoint, p.adjust.method = "none")
+summary(glht(aov(prot_per_rna ~ timepoint, data = downplotdat), linfct = mcp(timepoint = "Dunnett")))
+
+median_10 <- quantile(plotdat$prot_per_rna[plotdat$timepoint=="10h"])
+median_10_down <- quantile(plotdat$prot_per_rna[plotdat$geneID%in%down_genes0_10&plotdat$timepoint=="10h"])
+median_10_up <- quantile(plotdat$prot_per_rna[plotdat$geneID%in%up_genes0_10&plotdat$timepoint=="10h"])
+
+
+plotdat <- cbind.data.frame("prot_fraction" = fractions_df[,5], "rna_fraction" = fractions_df[,10])
+rownames(plotdat) <- rownames(fractions_df)
+
+
+corr <- round(cor(plotdat[,1],plotdat[,2], method = "spearman"),3)
+ggplot(plotdat, aes(rna_fraction,prot_fraction))+
+				geom_point(data = plotdat[rownames(plotdat)%in%down_genes0_10,], shape = 16, size = 1, alpha = .5, color = "#0571b0")+ 
+				geom_point(data = plotdat[rownames(plotdat)%in%up_genes0_10,], shape = 16, size = 1, color = "#ca0020", alpha = .5)+ 
+				#geom_point(alpha = 0.4, shape = 1)+
+				geom_abline(slope = 1, size = 0.5, linetype = 2, intercept = log10(median_10_down[c(2,4)]), col="#0571b0")+
+				geom_abline(slope = 1, size = 1, linetype = 1, intercept = log10(median_10_down[3]), col="#0571b0")+
+				geom_abline(slope = 1, size = 0.5, linetype = 2, intercept = log10(median_10_up[c(2,4)]), col="#ca0020")+
+				geom_abline(slope = 1, size = 1, linetype = 1, intercept = log10(median_10_up[3]), col="#ca0020")+
+				scale_x_log10()+#limits = c(1e-6,1e-2))+
+				scale_y_log10()+#limits = c(1e-6,1e-2))+
+				coord_cartesian(xlim = c(5e-7,5e-2),ylim = c(5e-7,5e-2))+
+				labs(title = paste0("spearman correlation: ",corr))+
+				annotation_logticks()->a
+a
+ggsave("plots/correlation_across_genes_10h_updown.svg",a,"svg",width = 3.4, height = 3.4)
+
+
+```
+
+# Mefisto analysis
+
+```{r train_mefisto, warning=FALSE, message=FALSE}
+# Prepare data, and create MOFA object
+all_samples <- sort(union(colnames(protein_data), colnames(rna_data)))
+
+# MOFA requires protein data to have the same samples as RNA data, but samples with only NAs are allowed
+protein_data_mefisto <- matrix(NA, nrow=nrow(protein_data), ncol=length(all_samples))
+rownames(protein_data_mefisto) <- rownames(protein_data)
+colnames(protein_data_mefisto) <- all_samples
+protein_data_mefisto[rownames(protein_data_log),colnames(protein_data_log)] <- protein_data_log
+protein_data_mefisto <- protein_data_mefisto[, colnames(rna_data)]
+
+rna_data_mefisto <- rna_data_log
+
+# Use all genes for which we have both protein and RNA data
+use_genes <- intersect(rownames(protein_data_mefisto), rownames(rna_data_mefisto))
+rna_data_mefisto <- rna_data_mefisto[intersect(rownames(rna_data_mefisto),use_genes), ]
+protein_data_mefisto <- protein_data_mefisto[intersect(rownames(protein_data_mefisto),use_genes), ]
+
+
+scaled_rna_data <- scale_rows(rna_data_mefisto)
+scaled_protein_data <- scale_rows(protein_data_mefisto)
+
+
+n_factors  <- 6
+
+data <- list(protein=scaled_protein_data,
+						 rna=scaled_rna_data)
+meta_data_mofa <- meta_data_rna %>%
+	mutate(Time = as.numeric(Time)) %>%
+	dplyr::rename(sample = sample_id)
+
+mofa_object <- create_mofa(data)
+samples_metadata(mofa_object) <- meta_data_mofa
+mofa_object <- set_covariates(mofa_object, covariates = "Time")
+
+data_opts <- get_default_data_options(mofa_object)
+model_opts <- get_default_model_options(mofa_object)
+model_opts$num_factors <- n_factors 
+train_opts <- get_default_training_options(mofa_object)
+train_opts$maxiter <- 1000
+mefisto_opts <- get_default_mefisto_options(mofa_object)
+
+mofa_object <- prepare_mofa(mofa_object, model_options = model_opts,
+														mefisto_options = mefisto_opts,
+														training_options = train_opts,
+														data_options = data_opts)
+mofa_object  <- run_mofa(mofa_object, use_basilisk = T)
+mofa_object
+
+## Flip factor 1, so positive values mean increasing expression
+# mofa_object@expectations[[3]][[1]][,"Factor1"] <- -1 * mofa_object@expectations[[3]][[1]][,"Factor1"]
+# mofa_object@expectations[[3]][[2]][,"Factor1"] <- -1 * mofa_object@expectations[[3]][[2]][,"Factor1"]
+# mofa_object@expectations[[2]][[1]][,"Factor1"] <- -1 * mofa_object@expectations[[2]][[1]][,"Factor1"]
+```
+
+```{r mefisto_plots, warning=FALSE, message=FALSE, fig.width=2.8, fig.height=1.8}
+plot_data_overview(mofa_object)
+plot_variance_explained(mofa_object)
+
+calculate_variance_explained(mofa_object)$r2_per_factor$group1 %>%
+	data.frame() %>%
+	mutate(protein = round(protein,2), rna = round(rna,2)) %>%
+	kable %>%
+	kable_styling(font_size = 10, fixed_thead = T) %>%
+	row_spec(0, color="white", background="black")
+
+plot_data <- calculate_variance_explained(mofa_object)$r2_per_factor$group1 %>%
+	as.data.frame() %>%
+	rownames_to_column(var="Factor") %>%
+	pivot_longer(cols = -Factor, names_to = "Modality", values_to = "Percent_explained") %>%
+	mutate(Modality = factor(Modality, levels = c("rna","protein")))
+
+ggplot(plot_data[1:6,], aes(x=Factor, y=Percent_explained, fill=Modality)) +
+	geom_bar(position="dodge", stat="identity", col = "black", lwd = 0.25)+
+	labs(y="Percent explained")+
+	theme(axis.text = element_text(size = 8), axis.title.x = element_blank(), axis.text.x = element_text(colour = "black"))->a
+a
+ggsave("plots/perc_varience_explained.svg",a,"svg",width = 2.8, height = 1.5)
+
+plot_factors_vs_cov(mofa_object, color_by="Rep", factors=1:n_factors )
+for(tmp_factor in colnames(get_factors(mofa_object)[[1]])){
+	plot_data <- data.frame(Factor=get_factors(mofa_object)[[1]][,tmp_factor],
+													Time=mofa_object@covariates[[1]][1,],
+													Biorep=rep(c("a","b","c","d"), 6))
+	
+	p <- ggplot(plot_data, aes(y=Factor, x=Time, col=Biorep)) +
+		geom_smooth(fill="gray75", col="black", lty = "dashed") + 
+		geom_point(size=3, stroke = 1, alpha = 0.5) +
+		coord_cartesian(ylim = c(-3,3))+
+		labs(title=tmp_factor)
+	
+	print(p)
+}
+```
+
+### RNA vs proteins in factors
+
+```{r plot_prot_vs_rna, fig.align='center', fig.align='center', fig.width=3, fig.height=3, warning=FALSE}
+# get gene ids present in both data sets
+use_genes <- intersect(rownames(data$protein), rownames(data$rna))
+
+# extract loadings for these genes
+loadings <- get_expectations(mofa_object, "W")
+
+prot_vals <- loadings[["protein"]][paste(use_genes,"_protein", sep=""), 1]
+rna_vals <- loadings[["rna"]][paste(use_genes,"_rna", sep=""), 1]
+loadings_1 <- data.frame(gene=names(prot_vals), protein=prot_vals, rna=rna_vals)
+loadings_1$regulation <- "none"
+loadings_1$regulation[loadings_1$protein>0.45&loadings_1$rna>0.45] <- "up_both"
+loadings_1$regulation[loadings_1$protein< -0.45&loadings_1$rna< -0.45] <- "down_both"
+loadings_1$regulation[loadings_1$protein>0.45&loadings_1$rna< -0.45] <- "up_prot_down_rna"
+loadings_1$regulation[loadings_1$protein< -0.45&loadings_1$rna>0.45] <- "up_rna_down_prot"
+loadings_1$regulation <- factor(loadings_1$regulation, c("up_prot_down_rna","up_both","down_both","up_rna_down_prot","none"))
+loadings_1$group <- ""
+
+ggplot(loadings_1[loadings_1$regulation!="none",], aes(x= group, fill = regulation))+
+	geom_bar(position = "stack")+
+	scale_fill_brewer(palette = "Set2")+
+	coord_polar("y", start = 0.5*pi)+
+	theme_void()->a
+a
+ggsave("plots/pie_factor1_045cutoff.svg",a,"svg",height = 4, width = 4)
+summary(loadings_1$regulation)
+
+
+use_genes <- substr(loadings_1$gene[loadings_1$regulation!="none"],1,6)
+
+table_fact1 <- cbind.data.frame(
+	gene_info[match(use_genes,gene_info$UniProt_ID),], 
+	loadings_1[loadings_1$regulation!="none",c(2:4)]
+)
+
+head(table_fact1, n = 10)
+write.table(table_fact1, file = "tables/table_fact1.tsv", sep = "\t", quote = F, row.names = T, col.names = NA)
+
+```
+
+### Gene Onotology vs MEFISTO factors (GSEA)
+
+[Gene Set Enrichment Analysis](https://www.gsea-msigdb.org/gsea/index.jsp) is used to see if any Gene Ontology terms have higher (or lower) levels of the MEFISTO factors than expected by chance. We do this separately for the RNA and protein data.
+
+#### RNA
+
+```{r piano_factors_rna, message=FALSE, warning=FALSE, results='asis'}
+gsa_res_lst_rna <- list()
+i <- 1
+max_gsea_pval <- 1e-3
+max_gsea_terms <- 50
+
+for(f in 1:3){
+	cat("#### Factor ", f, " \n\n")
+	
+	factor_data_tmp <- get_weights(mofa_object, views="rna", factors = f)
+	factor_data <- factor_data_tmp$rna[,1]
+	names(factor_data) <- rownames(factor_data_tmp$rna) %>% 
+		str_replace(., "_rna", "")	
+	
+	for(ont in c("P")){
+		#cat("##### ", ont," \n\n")
+		
+		piano_go_data <- gene_annot_tab %>%
+			#dplyr::filter(GO_TYPE == ont) %>%
+			dplyr::select(UniProt_ID, GO_TERM, GO_DESCRIPTION, GO_TYPE) %>% 
+			unite(col = GO, GO_TYPE, GO_TERM, GO_DESCRIPTION, sep = " ")
+		
+		dicty_gsc <- loadGSC(piano_go_data)
+		gsa_res <- runGSA(factor_data, 
+											gsc = dicty_gsc, 
+											gsSizeLim = c(10, Inf),
+											geneSetStat = "gsea", 
+											ncpus = 4)
+		
+		gsa_res_lst_rna[[i]] <- gsa_res
+		i <- i +1
+		
+		gsea_up_tab <- GSAsummaryTable(gsaRes = gsa_res) %>%
+			dplyr::filter(`p adj (dist.dir.up)`<max_gsea_pval) %>%
+			arrange(`p adj (dist.dir.up)`) %>%
+			dplyr::select("Name", "Genes (tot)", "Stat (dist.dir)", "p adj (dist.dir.up)") %>%
+			head(max_gsea_terms)
+		
+		gsea_down_tab <- GSAsummaryTable(gsaRes = gsa_res) %>%
+			dplyr::filter(`p adj (dist.dir.dn)`<max_gsea_pval) %>%
+			arrange(`p adj (dist.dir.dn)`) %>%
+			dplyr::select("Name", "Genes (tot)", "Stat (dist.dir)", "p adj (dist.dir.dn)") %>%
+			head(max_gsea_terms) 
+		
+		
+		gsea_up_tab %>%	
+			kable(booktabs = TRUE) %>%
+			kable_styling(font_size = 10, fixed_thead = T) %>%
+			row_spec(0, color="white", background="black") %>%
+			scroll_box(width = "100%", height = "300px") %>%
+			print
+		
+		gsea_down_tab %>%
+			kable(booktabs = TRUE) %>%
+			kable_styling(font_size = 10) %>%
+			row_spec(0, color="white", background="black") %>%
+			scroll_box(width = "100%", height = "300px") %>%
+			print
+		
+		
+		write.table(gsea_up_tab, file=paste("tables/GSEA_RNA_F", f, "_up.tsv" ,sep=""), row.names = F, sep="\t")
+		write.table(gsea_down_tab, file=paste("tables/GSEA_RNA_F", f, "_down.tsv" ,sep=""), row.names = F, sep="\t")
+	}
+}
+```
+
+## Protein
+
+```{r piano_factors_protein, message=FALSE, warning=FALSE, results='asis'}
+gsa_res_lst_prot <- list()
+i <- 1
+
+for(f in 1:3){
+	cat("#### Factor ", f, " \n\n")
+	
+	factor_data_tmp <- get_weights(mofa_object, views="protein", factors = f)
+	factor_data <- factor_data_tmp$protein[,1]
+	names(factor_data) <- rownames(factor_data_tmp$protein) %>% 
+		str_replace(., "_protein", "")	
+	
+	for(ont in c("P")){
+		#cat("##### ", ont," \n\n")
+		
+		piano_go_data <- gene_annot_tab %>%
+			#dplyr::filter(GO_TYPE == ont) %>%
+			dplyr::select(UniProt_ID, GO_TERM, GO_DESCRIPTION, GO_TYPE) %>% 
+			unite(col = GO, GO_TYPE, GO_TERM, GO_DESCRIPTION, sep = " ")
+		
+		dicty_gsc <- loadGSC(piano_go_data)
+		gsa_res <- runGSA(factor_data, 
+											gsc = dicty_gsc, 
+											gsSizeLim = c(10, Inf),
+											geneSetStat = "gsea", 
+											ncpus = 4)
+		
+		gsa_res_lst_prot[[i]] <- gsa_res
+		i <- i +1
+		
+	gsea_up_tab <- GSAsummaryTable(gsaRes = gsa_res) %>%
+			dplyr::filter(`p adj (dist.dir.up)`< max_gsea_pval ) %>%
+			arrange(`p adj (dist.dir.up)`) %>%
+			dplyr::select("Name", "Genes (tot)", "Stat (dist.dir)", "p adj (dist.dir.up)") %>%
+			head(max_gsea_terms)
+		
+		gsea_down_tab <-GSAsummaryTable(gsaRes = gsa_res) %>%
+			dplyr::filter(`p adj (dist.dir.dn)`< max_gsea_pval ) %>%
+			arrange(`p adj (dist.dir.dn)`) %>%
+			dplyr::select("Name", "Genes (tot)", "Stat (dist.dir)", "p adj (dist.dir.dn)") %>%
+			head(max_gsea_terms) 
+		
+		
+		gsea_up_tab %>%	
+			kable(booktabs = TRUE) %>%
+			kable_styling(font_size = 10, fixed_thead = T) %>%
+			row_spec(0, color="white", background="black") %>%
+			scroll_box(width = "100%", height = "300px") %>%
+			print
+		
+		gsea_down_tab %>%
+			kable(booktabs = TRUE) %>%
+			kable_styling(font_size = 10) %>%
+			row_spec(0, color="white", background="black") %>%
+			scroll_box(width = "100%", height = "300px") %>%
+			print
+		
+		
+		write.table(gsea_up_tab, file=paste("tables/GSEA_PROT_F", f, "_up.tsv" ,sep=""), row.names = F, sep="\t")
+		write.table(gsea_down_tab, file=paste("tables/GSEA_PROT_F", f, "_down.tsv" ,sep=""), row.names = F, sep="\t")
+		
+	}
+}
+```
+
+## Combining results for RNA and protein
+
+```{r go_rna_prot, warning=FALSE,  results='asis'}
+factor1_bp_rna <- GSAsummaryTable(gsaRes = gsa_res_lst_rna[[1]])
+
+factor2_bp_rna <- GSAsummaryTable(gsaRes = gsa_res_lst_rna[[2]])
+
+factor3_bp_rna <- GSAsummaryTable(gsaRes = gsa_res_lst_rna[[3]])
+
+factor1_bp_prot <- GSAsummaryTable(gsaRes = gsa_res_lst_prot[[1]])
+
+factor2_bp_prot <- GSAsummaryTable(gsaRes = gsa_res_lst_prot[[2]])
+
+factor3_bp_prot <- GSAsummaryTable(gsaRes = gsa_res_lst_prot[[3]])
+
+
+combine_gsea_results <- function(rna_res, protein_res, xlabel="rna", ylabel="protein", title=""){
+	plot_data <- as_tibble(rna_res) %>%
+		inner_join(as_tibble(protein_res), by = "Name", suffix = c(".rna", ".prot")) %>%
+		dplyr::rename_with( ~ gsub("\\ \\(dist.dir\\)", "", .x), fixed = TRUE) %>%
+		dplyr::rename_with( ~ gsub("\\ \\(tot\\)", "", .x), fixed = TRUE) %>%
+		rowwise() %>%
+		mutate(min_padj = min(`p adj (dist.dir.up).rna`, `p adj (dist.dir.dn).rna`, `p adj (dist.dir.up).prot`, `p adj (dist.dir.dn).prot`, na.rm = T)) %>%
+		# mutate(min_padj = min(`p (dist.dir.up).rna`, `p (dist.dir.dn).rna`, `p (dist.dir.up).prot`, `p (dist.dir.dn).prot`, na.rm = T)) %>%
+		mutate(minus_log10_padj = -1*log10(min_padj+1e-6)) %>%
+		dplyr::select(Name, Genes.rna, Stat.rna, Stat.prot, minus_log10_padj) %>%
+		filter(minus_log10_padj >= 2) %>%
+		dplyr::rename(Genes = Genes.rna) %>%
+		mutate(type = case_when(
+			grepl("ribo|translation|small-subunit|rRNA", Name) ~ "Ribosome",
+			grepl("phagocytosis", Name) ~ "Phagocytosis",
+			grepl("pinocytosis", Name) ~ "Pinocytosis",
+			grepl("ubiquitin|proteolysis|proteas|peptidase", Name) ~ "Protein degradation",
+			grepl("peroxisome|oxidation", Name) ~ "Oxidation",
+			grepl("actin|cortex ", Name) ~ "Actin",
+			grepl("membrane", Name) ~ "Membrane",
+			grepl("metabo|tricarboxylic", Name) ~ "Metabolism",
+			grepl("protein binding", Name) ~ "Protein binding",
+			grepl("sorocarp|development", Name) ~ "Sorocarp",
+			grepl("chemotaxis|motility|migration", Name) ~ "Chemotaxis",
+			.default = NULL
+		))%>%
+		mutate(order = case_when(is.na(type) ~ 2, .default = 1))
+	
+	ggplot(plot_data, aes(x = Stat.rna, y = Stat.prot, size=minus_log10_padj, colour=type, order=order)) +
+		geom_point() + 
+		scale_size(range = c(1,4), breaks = 2:4, limits = c(2,4), labels = c(0.01,0.001,0.0001))+
+		xlim(-1,1) + 
+		ylim(-1,1) + 
+		labs(x=xlabel,y=ylabel,size="p-value",color="GO-term")
+}
+```
+
+
+##### Biological process
+
+```{r go_rna_prot_bp, warning=FALSE,  results='asis', fig.width=3.3, fig.height=2}
+
+factor2_bp_rna %>%
+	`colnames<-`(c("Name","genes","stat","pup","padjup","pdown","padjdown","genesup","genesdown"))%>%
+mutate(type = case_when(
+			grepl("ribo|translation|small-subunit|rRNA", Name) ~ "Translation",
+			grepl("ubiquitin|proteolysis|proteas|peptidase", Name) ~ "Protein degradation",
+			grepl("actin|cortex|cytoskeleton ", Name) ~ "Actin",
+			grepl("chemotaxis|motility|migration|cAMP", Name) ~ "Chemotaxis",
+			.default = NULL
+		)) %>% mutate(padj = coalesce(padjup, padjdown))%>%
+	rowwise() %>%
+	mutate(logpadj = min(-log10(padj),4)) -> factor2_bp_rna_classified
+
+
+ggplot(factor2_bp_rna_classified, aes(y = logpadj,x= stat, fill = type))+
+	geom_point(shape = 21, size = 1.5, stroke = 0.3)+
+	scale_fill_manual(values = brewer.pal(9, "Dark2")[-c(4,5)], na.value = "white")+
+	labs(y = "-log10(adjusted p-value)", x = "Factor 2: mRNA",fill = "GO-term class")->a
+a
+ggsave("plots/factor2_RNA_goterm.svg",a,"svg",width = 3.3,height = 2)
+	
+	
+```
+
+
+
+### Genes selected from functional annotations
+
+#### Arp2/3 and Proteasome complex genes
+
+```{r proteasome_genes, message=FALSE, warning=FALSE, results='asis', fig.width=3.7, fig.height=3}
+
+use_genes <- substr(loadings_1$gene[loadings_1$regulation=="up_prot_down_rna"|loadings_1$regulation=="up_rna_down_prot"],1,6)
+
+lines_data <- rbind(
+	pivot_longer(data.frame(scale_rows(log10(rna_data_means[use_genes,])), gene = use_genes, data = "mRNA"),cols = -c(gene,data)),
+	pivot_longer(data.frame(scale_rows(log10(prot_data_means[use_genes,])), gene = use_genes, data = "protein"),cols = -c(gene,data)))
+lines_data$name <- as.numeric(gsub('[Xh]','',lines_data$name))
+
+heatmap_data <- lines_data
+heatmap_data$colname <- paste0(heatmap_data$data,"_",heatmap_data$name)
+heatmap_data <- heatmap_data[,c(1,5,4)]
+heatmap_data <- pivot_wider(heatmap_data, names_from = colname)
+heatmap_data <- heatmap_data[,-1]
+rownames(heatmap_data) <- uniprot_to_gene_name[use_genes]
+
+colnames(heatmap_data) <- c("0","2","4","6","8","10","0","2","4","8","10")
+
+#svglite("plots/factor1_updown_heatmap.svg",width = 3.7,height = 3)
+Heatmap(heatmap_data,
+				cluster_columns = FALSE,
+				cluster_rows = T,use_raster = F,
+				show_row_names = T, row_split = 2, show_row_dend = F,
+				col = colorRamp2(2:-2, colorRampPalette(brewer.pal(11,"RdYlBu"))(5)), 
+				column_names_side = c("top"), 
+				column_names_rot = 0,   column_names_centered = T, column_names_gp = gpar(fontsize = 7), row_names_gp = gpar(fontsize = 7),
+				heatmap_legend_param = list(title = "z-score",
+																		labels_gp = gpar(fontsize = 6), 
+																		title_gp = gpar(fontsize = 6, fontface = "bold"), 
+																		grid_width = unit(3,"mm")),
+				column_split = factor(c(rep("mRNA",6),rep("protein",5)), levels = c("mRNA","protein")),
+				#cluster_column_slices = FALSE,
+				#column_gap = unit(c(rep(0,10),2,rep(0,5)), "mm"),
+				column_title_gp = gpar(fontsize = 8, fontface="bold"), 
+				row_title_gp = gpar(fontsize = 0)
+)->a
+a
+#dev.off()
+
+
+
+use_genes <- names(uniprot_to_gene_name)[uniprot_to_gene_name%in%c("arcA","arcB","arcC","arcD","arcE","arpB","arpC")]
+
+
+lines_data <- rbind(
+	pivot_longer(data.frame(scale_rows(log10(rna_data_means[use_genes,])), gene = c("arcA","arcB","arcC","arcD","arcE","arpB","arpC"), data = "mRNA"),cols = -c(gene,data)),
+	pivot_longer(data.frame(scale_rows(log10(prot_data_means[use_genes,])), gene = c("arcA","arcB","arcC","arcD","arcE","arpB","arpC"), data = "protein"),cols = -c(gene,data)))
+lines_data$name <- as.numeric(gsub('[Xh]','',lines_data$name))
+
+ggplot(lines_data, aes(name, value))+
+	geom_smooth(color = "grey20", level = 0.95)+
+	geom_point(aes(fill = gene), shape = 21, stroke = 0.3)+
+	scale_fill_brewer(palette = "Dark2")+
+	scale_x_continuous("time(h)", breaks = seq(0,10,2))+
+	scale_y_continuous("z-score")+
+	facet_grid(~data)->a
+a
+ggsave("plots/arp2_3_line.svg",a,"svg",width = 3.7, height = 2)
+
+use_genes <- gene_annot_tab %>% 
+	filter(GO_TERM == "GO:0000502") %>% #Proteasome complex
+	dplyr::select(UniProt_ID) %>% 
+	as.data.frame() %>% 
+	.[,1] %>% 
+	unique()
+use_genes <- intersect(use_genes, rownames(rna_data))
+
+
+heatmap_data <- na.omit(as.matrix(cbind(LFCrna[use_genes,],
+																				LFCprot[use_genes,])))
+
+pheatmap(heatmap_data,
+				 cluster_cols = F, 
+				 cluster_rows = T,
+				 fontsize_row = 0.1, 
+				 gaps_col = 5,
+				 color =  heatmap_color_scale,
+				 heatmap_legend_param = list(title = "logFC"),
+				 main = "Proteasome complex",
+				 use_raster = F)
+
+scatterplot_rna_prot_highlight(loadings, use_genes = common_expressed, highlight_genes = use_genes, rna_factor = 2, prot_factor = 1)
+
+```
+
+# Print data for shiny app
+
+```{r shiny_data}
+shiny_data_dir <- "shinyapp/shiny_data/"
+dir.create(shiny_data_dir)
+
+# Normalized RNA-seq data
+write.table(assay(norm_rna_data), paste(shiny_data_dir,"rna_exp.tsv", sep=""), sep="\t")
+
+# Normalized protein data
+write.table(mass_spec_impute, paste(shiny_data_dir,"protein_exp.tsv", sep=""), sep="\t")
+
+# Info on which values have been imputed (matrix TRUE/FALSE)
+protein_exp_is_imputed <- is.na(mass_spec[rownames(mass_spec_impute),colnames(mass_spec_impute)])
+write.table(protein_exp_is_imputed, paste(shiny_data_dir,"protein_exp_is_imputed.tsv", sep=""), sep="\t")
+
+# Differential expression p-values
+shiny_rna_de_res <- as.data.frame(res) %>% rownames_to_column("UniProt_ID")
+write_tsv(shiny_rna_de_res, paste(shiny_data_dir,"rna_de_res.tsv", sep=""))
+
+shiny_protein_de_res <- as.data.frame(tt_dev) %>% rownames_to_column("UniProt_ID")
+write_tsv(shiny_protein_de_res, paste(shiny_data_dir,"protein_de_res.tsv", sep=""))
+
+# Gene annotations, RNA id, protein id, gene name, description
+use_genes <- union(rownames(tt_dev), rownames(res))
+shiny_gene_info_tab <- gene_annot_tab %>%
+	group_by(UniProt_ID) %>%
+	summarise(GENE_ID = dplyr::first(GENE_ID),
+						Gene_Name = dplyr::first(Gene_Name),
+						Gene_products = dplyr::first(Gene_products)) %>%
+	mutate(Gene_products = replace_na(Gene_products, "")) %>%
+	filter(UniProt_ID %in% use_genes)
+write.table(shiny_gene_info_tab, paste(shiny_data_dir,"gene_info.tsv", sep=""),  row.names = F, sep="\t")
+```
+
+
+# Session info
+
+```{r session_info}
+sessionInfo()
+```

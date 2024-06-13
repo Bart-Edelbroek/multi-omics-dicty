@@ -1,0 +1,37 @@
+"Name"	"Genes (tot)"	"Stat (dist.dir)"	"p adj (dist.dir.up)"
+"C GO:0045335 phagocytic vesicle"	266	0.37838	0
+"P GO:0006412 translation"	181	0.40368	0
+"C GO:0005938 cell cortex"	83	0.54912	0
+"C GO:0030864 cortical actin cytoskeleton"	23	0.71009	0
+"C GO:0001891 phagocytic cup"	23	0.71135	0
+"F GO:0051015 actin filament binding"	48	0.7077	0
+"C GO:0015629 actin cytoskeleton"	38	0.59214	0
+"F GO:0003779 actin binding"	87	0.61612	0
+"C GO:0031252 cell leading edge"	47	0.59456	0
+"C GO:0031143 pseudopodium"	33	0.68753	0
+"P GO:0009617 response to bacterium"	46	0.55659	0
+"F GO:0003735 structural constituent of ribosome"	112	0.47161	0
+"C GO:0005840 ribosome"	110	0.51342	0
+"C GO:0022625 cytosolic large ribosomal subunit"	52	0.62406	0
+"C GO:0030529 NA"	122	0.48422	0
+"F GO:0005089 NA"	17	0.71702	0
+"P GO:0035023 regulation of Rho protein signal transduction"	19	0.673	0
+"C GO:0005856 cytoskeleton"	84	0.55462	0
+"C GO:0044291 cell-cell contact zone"	11	0.81676	0
+"P GO:0045010 actin nucleation"	15	0.6856	0
+"C GO:0042995 cell projection"	22	0.75766	0
+"C GO:0022627 cytosolic small ribosomal subunit"	32	0.70528	0
+"F GO:0044183 protein folding chaperone"	10	0.77309	8.4723e-05
+"P GO:0006909 phagocytosis"	51	0.46516	8.7981e-05
+"P GO:0000281 mitotic cytokinesis"	64	0.4427	9.15e-05
+"C GO:0005615 extracellular space"	209	0.3576	9.5313e-05
+"C GO:0060187 cell pole"	10	0.78934	9.9457e-05
+"C GO:0005694 chromosome"	18	0.62852	0.00022694
+"C GO:0005885 Arp2/3 protein complex"	10	0.76145	0.00028046
+"C GO:0030175 filopodium"	18	0.60453	0.00044903
+"P GO:0030041 actin filament polymerization"	26	0.5236	0.00059306
+"P GO:0051591 response to cAMP"	11	0.70242	0.00061
+"P GO:0051017 actin filament bundle assembly"	13	0.66867	0.00062794
+"F GO:0005200 structural constituent of cytoskeleton"	12	0.68302	0.00064697
+"P GO:0006418 tRNA aminoacylation for protein translation"	29	0.50883	0.00066719
+"P GO:0007010 cytoskeleton organization"	11	0.70915	0.00068871

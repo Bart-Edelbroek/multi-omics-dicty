@@ -1,0 +1,5 @@
+"Name"	"Genes (tot)"	"Stat (dist.dir)"	"p adj (dist.dir.dn)"
+"C GO:0000502 proteasome complex"	38	-0.68038	0
+"C GO:0005839 proteasome core complex"	16	-0.73805	0
+"F GO:0004298 threonine-type endopeptidase activity"	15	-0.7768	0
+"C GO:0031201 SNARE complex"	22	-0.66523	3.1689e-05

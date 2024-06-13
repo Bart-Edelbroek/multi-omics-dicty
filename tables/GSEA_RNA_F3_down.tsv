@@ -1,0 +1,11 @@
+"Name"	"Genes (tot)"	"Stat (dist.dir)"	"p adj (dist.dir.dn)"
+"F GO:0003676 nucleic acid binding"	124	-0.56499	0
+"C GO:0005730 nucleolus"	90	-0.62133	0
+"C GO:0032040 small-subunit processome"	23	-0.77188	0
+"P GO:0042254 ribosome biogenesis"	44	-0.66032	0
+"P GO:0000462 maturation of SSU-rRNA from tricistronic rRNA transcript (SSU-rRNA, 5.8S rRNA, LSU-rRNA)"	18	-0.747	0
+"P GO:0006364 rRNA processing"	51	-0.66646	0
+"F GO:0004004 NA"	24	-0.67298	0.00015664
+"F GO:0003729 mRNA binding"	23	-0.6623	0.00019145
+"P GO:0008033 tRNA processing"	17	-0.70823	0.00021538
+"P GO:0006396 RNA processing"	25	-0.64581	0.00051691

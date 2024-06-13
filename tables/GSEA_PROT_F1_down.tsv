@@ -1,0 +1,12 @@
+"Name"	"Genes (tot)"	"Stat (dist.dir)"	"p adj (dist.dir.dn)"
+"C GO:0005739 mitochondrion"	262	-0.45205	0
+"C GO:0005730 nucleolus"	90	-0.49685	0
+"C GO:0030687 preribosome, large subunit precursor"	22	-0.66998	0
+"P GO:0042254 ribosome biogenesis"	44	-0.5767	0
+"P GO:0006364 rRNA processing"	51	-0.5488	0
+"P GO:0016126 sterol biosynthetic process"	14	-0.74177	0.00024543
+"P GO:0008202 steroid metabolic process"	11	-0.7989	0.00028633
+"F GO:0003735 structural constituent of ribosome"	112	-0.43395	0.0003436
+"F GO:0004812 aminoacyl-tRNA ligase activity"	34	-0.54898	0.0006013
+"F GO:0019843 rRNA binding"	20	-0.63667	0.00066811
+"P GO:0000462 maturation of SSU-rRNA from tricistronic rRNA transcript (SSU-rRNA, 5.8S rRNA, LSU-rRNA)"	18	-0.64489	0.00089804

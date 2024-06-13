@@ -1,0 +1,4 @@
+"Name"	"Genes (tot)"	"Stat (dist.dir)"	"p adj (dist.dir.dn)"
+"F GO:0003735 structural constituent of ribosome"	112	-0.51483	0
+"C GO:0005840 ribosome"	110	-0.53431	0
+"P GO:0006412 translation"	181	-0.44821	7.9625e-05

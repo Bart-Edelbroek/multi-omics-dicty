@@ -1,0 +1,25 @@
+"Name"	"Genes (tot)"	"Stat (dist.dir)"	"p adj (dist.dir.up)"
+"F GO:0051015 actin filament binding"	48	0.59055	0
+"F GO:0003779 actin binding"	87	0.50147	0
+"P GO:0043161 proteasome-mediated ubiquitin-dependent protein catabolic process"	20	0.80382	0
+"C GO:0000502 proteasome complex"	38	0.82335	0
+"P GO:0006511 ubiquitin-dependent protein catabolic process"	44	0.67932	0
+"F GO:0004175 endopeptidase activity"	19	0.74904	0
+"C GO:0005839 proteasome core complex"	16	0.82123	0
+"F GO:0004298 threonine-type endopeptidase activity"	15	0.86798	0
+"P GO:0030433 ubiquitin-dependent ERAD pathway"	15	0.74259	0
+"C GO:0008540 proteasome regulatory particle, base subcomplex"	10	0.86737	0
+"P GO:0031156 regulation of sorocarp development"	11	0.77894	0.00017974
+"C GO:0005938 cell cortex"	83	0.45893	0.00018576
+"P GO:0030435 sporulation resulting in formation of a cellular spore"	35	0.53955	0.00038111
+"C GO:0005783 endoplasmic reticulum"	98	0.43073	0.00041042
+"P GO:0051603 proteolysis involved in protein catabolic process"	27	0.5753	0.00057517
+"F GO:0005515 protein binding"	197	0.37656	0.00058463
+"F GO:0036459 NA"	13	0.70913	0.0006154
+"P GO:0016579 protein deubiquitination"	13	0.70913	0.0006154
+"C GO:0030864 cortical actin cytoskeleton"	23	0.59689	0.0006878
+"P GO:0031152 aggregation involved in sorocarp development"	69	0.45788	0.00073079
+"P GO:0031154 culmination involved in sorocarp development"	40	0.51205	0.00076368
+"P GO:0007155 cell adhesion"	23	0.59257	0.00078383
+"P GO:0030587 sorocarp development"	83	0.43315	0.00087362
+"P GO:0030866 cortical actin cytoskeleton organization"	13	0.70053	0.00099804
